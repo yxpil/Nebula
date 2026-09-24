@@ -1,0 +1,11 @@
+[package]
+name = "nebula-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nebula: page-based encrypted binary storage engine (MySQL-like pages)"
+
+[dependencies]
+nebula-core = { path = "../nebula-core" }
+nebula-crypto = { path = "../nebula-crypto" }
+rand = "0.8"

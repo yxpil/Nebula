@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nebula-core",
+    "crates/nebula-crypto",
+    "crates/nebula-tokenizer",
+    "crates/nebula-storage",
+    "crates/nebula-sql",
+    "crates/nebula-engine",
+    "crates/nebula-server",
+    "crates/nebula-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/yxpil/Nebula.git"
+
+[profile.release]
+opt-level = 2
+lto = false

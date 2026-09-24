@@ -1,0 +1,12 @@
+[package]
+name = "nebula-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nebula: database engine - records, inverted index, SQL execution, checkpointing"
+
+[dependencies]
+nebula-core = { path = "../nebula-core" }
+nebula-storage = { path = "../nebula-storage" }
+nebula-tokenizer = { path = "../nebula-tokenizer" }
+nebula-sql = { path = "../nebula-sql" }

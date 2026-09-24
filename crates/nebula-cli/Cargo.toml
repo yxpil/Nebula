@@ -1,0 +1,16 @@
+[package]
+name = "nebula-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nebula: command line client (local mode and remote mode)"
+
+[dependencies]
+nebula-core = { path = "../nebula-core" }
+nebula-engine = { path = "../nebula-engine" }
+nebula-server = { path = "../nebula-server" }
+rpassword = "7"
+
+[[bin]]
+name = "nebula"
+path = "src/main.rs"

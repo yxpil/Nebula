@@ -1,0 +1,4 @@
+/target
+*.ndb
+*.swp
+.DS_Store

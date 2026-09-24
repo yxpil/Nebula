@@ -1,0 +1,9 @@
+[package]
+name = "nebula-sql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nebula: MySQL-flavored SQL subset lexer/parser/AST"
+
+[dependencies]
+nebula-core = { path = "../nebula-core" }

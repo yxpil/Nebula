@@ -1,0 +1,14 @@
+[package]
+name = "nebula-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nebula: password-based key derivation, AEAD page encryption, HMAC/HKDF"
+
+[dependencies]
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"

@@ -1,0 +1,10 @@
+[package]
+name = "nebula-tokenizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nebula: jieba-rs based CN/EN tokenizer, keyword and key-point extraction"
+
+[dependencies]
+nebula-core = { path = "../nebula-core" }
+jieba-rs = "0.7"
