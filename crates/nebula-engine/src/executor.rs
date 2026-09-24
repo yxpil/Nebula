@@ -7,12 +7,18 @@
 //!
 //! AI 检索(SEARCH / RELATED)走 [`crate::search`] 的三层模型:
 //! BM25 打分 → 共现图查询扩展 → 种子相似度联合重排。
+//! 排序结果经 [`crate::cache::QueryCache`] 缓存:重复检索直接复用,
+//! 写操作(INSERT/UPDATE/DELETE)后由 database 整体失效。
 
 use std::collections::BTreeSet;
 
 use nebula_core::{Keyword, MemoryId, MemoryRecord, Result};
-use nebula_sql::ast::{CmpOp, Expr, Literal, RelatedSeed, SearchStmt, SelectColumn, Statement};
+use nebula_sql::ast::{
+    CacheTarget, CmpOp, Expr, Literal, RelatedSeed, SearchStmt, SelectColumn, SetCacheStmt,
+    ShowHotStmt, Statement,
+};
 
+use crate::cache;
 use crate::config::SearchConfig;
 use crate::database::Database;
 use crate::format::{
@@ -69,12 +75,6 @@ impl QueryResult {
     }
 }
 
-/// 一条带相关度分数的候选记忆。
-struct Ranked {
-    id: MemoryId,
-    score: f32,
-}
-
 impl Database {
     /// 执行一条 SQL,返回可渲染结果。
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
@@ -100,6 +100,15 @@ impl Database {
             Statement::Update(upd) => self.exec_update(&upd.assignments, upd.filter.as_ref()),
             Statement::Search(s) => self.exec_search(s),
             Statement::Related(r) => self.exec_related(r),
+            Statement::ShowCache => Ok(self.exec_show_cache()),
+            Statement::ClearCache => {
+                self.query_cache.clear();
+                Ok(QueryResult::message(
+                    "OK, query cache cleared (counters reset)",
+                ))
+            }
+            Statement::ShowHot(s) => Ok(self.exec_show_hot(s)),
+            Statement::SetCache(s) => self.exec_set_cache(s),
             Statement::Checkpoint => {
                 self.checkpoint()?;
                 Ok(QueryResult::message("checkpoint done"))
@@ -296,6 +305,9 @@ impl Database {
     // ------- SEARCH / RELATED(AI 检索)-------
 
     /// SEARCH '自然语言查询' [LIMIT n]:BM25 相关性排序。
+    ///
+    /// 排序结果按 (查询文本, 生效 limit) 缓存;重复检索直接复用,
+    /// 仅按需读记录(经文档缓存)。
     fn exec_search(&mut self, stmt: &SearchStmt) -> Result<QueryResult> {
         let cfg = self.cfg.search.clone();
         let query = self.query_vector(&stmt.query);
@@ -304,33 +316,54 @@ impl Database {
                 "query has no indexable terms (all stopwords or too short?)",
             ));
         }
-        let ranked = self.rank(&query, &[], &[], &cfg);
         let limit = stmt.limit.unwrap_or(cfg.default_limit);
-        self.materialize_ranked(ranked, limit)
+        let key = cache::search_key(&stmt.query, limit);
+        if let Some(ranked) = self.query_cache.get(&key) {
+            return self.materialize_ranked(ranked, limit);
+        }
+        let ranked = self.rank(&query, &[], &[], &cfg);
+        let truncated: Vec<(MemoryId, f32)> = ranked.iter().take(limit).copied().collect();
+        self.query_cache.put(key, truncated.clone());
+        self.materialize_ranked(truncated, limit)
     }
 
     /// RELATED TO <id> | RELATED '文本' [LIMIT n]:以种子做联想推荐。
+    ///
+    /// 排序结果按 (种子, 生效 limit) 缓存,语义与 SEARCH 相同。
     fn exec_related(&mut self, stmt: &nebula_sql::ast::RelatedStmt) -> Result<QueryResult> {
         let cfg = self.cfg.search.clone();
-        let (seed, exclude) = match &stmt.seed {
+        let limit = stmt.limit.unwrap_or(cfg.default_limit);
+        let (seed, exclude, key) = match &stmt.seed {
             RelatedSeed::Id(id) => {
                 let Some(rec) = self.fetch_record(*id)? else {
                     return Err(nebula_core::Error::Sql(format!(
                         "RELATED TO: no memory with id {id}"
                     )));
                 };
-                (keyword_pairs(&rec.keywords), vec![*id])
+                (
+                    keyword_pairs(&rec.keywords),
+                    vec![*id],
+                    cache::related_id_key(*id, limit),
+                )
             }
-            RelatedSeed::Text(text) => (self.query_vector(text), Vec::new()),
+            RelatedSeed::Text(text) => (
+                self.query_vector(text),
+                Vec::new(),
+                cache::related_text_key(text, limit),
+            ),
         };
         if seed.is_empty() {
             return Ok(QueryResult::ranked_empty(
                 "seed has no indexable terms (all stopwords or too short?)",
             ));
         }
+        if let Some(ranked) = self.query_cache.get(&key) {
+            return self.materialize_ranked(ranked, limit);
+        }
         let ranked = self.rank(&seed, &seed, &exclude, &cfg);
-        let limit = stmt.limit.unwrap_or(cfg.default_limit);
-        self.materialize_ranked(ranked, limit)
+        let truncated: Vec<(MemoryId, f32)> = ranked.iter().take(limit).copied().collect();
+        self.query_cache.put(key, truncated.clone());
+        self.materialize_ranked(truncated, limit)
     }
 
     /// 文本 → (词项, 权重) 查询向量(与建库时的关键词提取同一管线)。
@@ -353,7 +386,7 @@ impl Database {
         seed: &[(String, f32)],
         exclude: &[MemoryId],
         cfg: &SearchConfig,
-    ) -> Vec<Ranked> {
+    ) -> Vec<(MemoryId, f32)> {
         // 第一层之一:共现图查询扩展(跳数/上限/衰减均来自配置)
         let mut q_all: Vec<(String, f32)> = query.to_vec();
         for (term, w) in self.index.expand(query, cfg) {
@@ -366,7 +399,7 @@ impl Database {
         let candidates = self.index.docs_with_terms(terms.iter().copied());
         let bm25 = self.index.bm25(&q_all, cfg);
         // 第二、三层:种子余弦 + 联合重排
-        let mut out: Vec<Ranked> = Vec::with_capacity(candidates.len());
+        let mut out: Vec<(MemoryId, f32)> = Vec::with_capacity(candidates.len());
         for id in candidates {
             if exclude.contains(&id) {
                 continue;
@@ -378,27 +411,30 @@ impl Database {
             };
             let score = bm25.get(&id).copied().unwrap_or(0.0) + cfg.similarity_weight * cos;
             if score >= cfg.min_score {
-                out.push(Ranked { id, score });
+                out.push((id, score));
             }
         }
         out.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
+            b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.id.cmp(&b.id))
+                .then_with(|| a.0.cmp(&b.0))
         });
         out
     }
 
     /// 取前 `limit` 条候选,读记录并投影为结果集。
-    fn materialize_ranked(&mut self, ranked: Vec<Ranked>, limit: usize) -> Result<QueryResult> {
+    fn materialize_ranked(
+        &mut self,
+        ranked: Vec<(MemoryId, f32)>,
+        limit: usize,
+    ) -> Result<QueryResult> {
         let ex_cfg = self.extractor.config().clone();
         let mut rows = Vec::with_capacity(ranked.len().min(limit));
-        for r in ranked.into_iter().take(limit) {
-            if let Some(rec) = self.fetch_record(r.id)? {
+        for (id, score) in ranked.into_iter().take(limit) {
+            if let Some(rec) = self.fetch_record(id)? {
                 rows.push(vec![
                     rec.id.to_string(),
-                    format!("{:.4}", r.score),
+                    format!("{score:.4}"),
                     rec.content.clone(),
                     fmt_keywords(&rec.keywords, ex_cfg.max_keywords),
                     fmt_tags(&rec.tags),
@@ -412,6 +448,74 @@ impl Database {
             message: String::new(),
             affected: 0,
         })
+    }
+
+    // ------- 缓存管理 -------
+
+    /// SHOW CACHE:查询缓存 / 文档缓存的容量与命中统计。
+    fn exec_show_cache(&self) -> QueryResult {
+        let q = &self.query_cache;
+        let d = &self.doc_cache;
+        let rows = vec![
+            vec!["query_cache_capacity".into(), q.capacity().to_string()],
+            vec!["query_cache_entries".into(), q.len().to_string()],
+            vec!["query_cache_hits".into(), q.hits().to_string()],
+            vec!["query_cache_misses".into(), q.misses().to_string()],
+            vec!["query_cache_evictions".into(), q.evictions().to_string()],
+            vec!["query_cache_epoch".into(), q.epoch().to_string()],
+            vec!["doc_cache_capacity".into(), d.capacity().to_string()],
+            vec!["doc_cache_entries".into(), d.len().to_string()],
+            vec!["doc_cache_hits".into(), d.hits().to_string()],
+            vec!["doc_cache_misses".into(), d.misses().to_string()],
+            vec!["doc_cache_evictions".into(), d.evictions().to_string()],
+            vec!["hot_tracked".into(), self.index.heat_len().to_string()],
+        ];
+        QueryResult {
+            columns: vec!["Variable".into(), "Value".into()],
+            rows,
+            message: String::new(),
+            affected: 0,
+        }
+    }
+
+    /// SHOW HOT [LIMIT n]:按读取热度展示记忆(默认 limit 取检索默认条数)。
+    fn exec_show_hot(&self, stmt: &ShowHotStmt) -> QueryResult {
+        let n = stmt.limit.unwrap_or(self.cfg.search.default_limit);
+        let rows: Vec<Vec<String>> = self
+            .index
+            .hottest(n)
+            .into_iter()
+            .map(|id| {
+                vec![
+                    id.to_string(),
+                    self.index.heat_of(id).to_string(),
+                    self.doc_cache.contains(id).to_string(),
+                ]
+            })
+            .collect();
+        QueryResult {
+            columns: vec!["id".into(), "heat".into(), "cached".into()],
+            rows,
+            message: String::new(),
+            affected: 0,
+        }
+    }
+
+    /// SET CACHE query|doc <n>:在线调整缓存容量(0 = 关闭,缩小即时淘汰)。
+    fn exec_set_cache(&mut self, stmt: &SetCacheStmt) -> Result<QueryResult> {
+        let (name, capacity) = match stmt.target {
+            CacheTarget::Query => {
+                self.query_cache.set_capacity(stmt.capacity);
+                ("query", self.query_cache.capacity())
+            }
+            CacheTarget::Doc => {
+                self.doc_cache.set_capacity(stmt.capacity);
+                ("doc", self.doc_cache.capacity())
+            }
+        };
+        Ok(QueryResult::message(format!(
+            "OK, {name} cache capacity set to {capacity}"
+        )))
     }
 
     // ------- DELETE -------

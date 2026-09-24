@@ -24,10 +24,16 @@ const HELP: &str = "\
   SEARCH 'rust 所有权' LIMIT 5;
   RELATED TO 12 LIMIT 5;
   RELATED '编译期检查 内存安全' LIMIT 5;
+  SHOW CACHE; CLEAR CACHE; SHOW HOT LIMIT 5; SET CACHE doc 256;
 说明:
   SEARCH / RELATED 按 BM25 相关度 + 共现联想 + 关键词相似度重排,
   返回列 id/score/content/keywords/tags/importance(score 为相关度分数)。
-  检索参数(k1/b/联想跳数/衰减/相似度权重等)见库旁配置 [engine.search] 段。";
+  检索参数(k1/b/联想跳数/衰减/相似度权重等)见库旁配置 [engine.search] 段。
+  查询缓存自动复用重复检索的排序结果,写操作后自动失效;
+  文档缓存按 LRU 保留读过的记录,热度随读取累计并跨重启保留;
+  SHOW CACHE 查看命中统计,CLEAR CACHE 清空查询缓存,
+  SHOW HOT 查看热点记忆,SET CACHE query|doc <n> 在线调整容量;
+  缓存容量与热点预加载条数见库旁配置 [engine.cache] 段。";
 
 /// 本地模式:直接驱动 [`Database`]。
 pub fn run_local(mut db: Database, cfg: &LoadedConfig) -> Result<()> {

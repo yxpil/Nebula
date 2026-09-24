@@ -9,8 +9,9 @@
 //! ```
 //!
 //! 设计要点:
-//! - 所有行为参数(页大小、检查点阈值、内容上限、分词、停用词、默认地址、
-//!   CLI 展示、密码策略)都在配置文件中,代码内没有可调常量;
+//! - 所有行为参数(页大小、检查点阈值、内容上限、分词、停用词、检索联想、
+//!   缓存容量与热点预加载、默认地址、CLI 展示、密码策略)都在配置文件中,
+//!   代码内没有可调常量;
 //! - 缺省字段回退内置默认值(与生成模板一致),保证向前兼容;
 //! - 本 crate 只负责“读/写/校验”,把解析结果转交各 crate 自己的配置类型
 //!   ([`nebula_engine::EngineConfig`] / [`nebula_tokenizer::ExtractorConfig`]);
@@ -278,6 +279,13 @@ impl LoadedConfig {
                 "engine.search.default_limit must be >= 1".into(),
             ));
         }
+        let k = &c.engine.cache;
+        if k.doc_cache_capacity == 0 && k.hot_preload > 0 {
+            return Err(Error::Config(
+                "engine.cache.hot_preload must be 0 when engine.cache.doc_cache_capacity = 0"
+                    .into(),
+            ));
+        }
         if c.tokenizer.extract.max_keywords == 0 || c.tokenizer.extract.max_key_points == 0 {
             return Err(Error::Config(
                 "tokenizer.max_keywords / max_key_points must be >= 1".into(),
@@ -368,6 +376,14 @@ similarity_weight = 0.5
 min_score = 0.0
 # SEARCH / RELATED 未显式 LIMIT 时的默认返回条数
 default_limit = 10
+
+[engine.cache]
+# 查询缓存容量:最近多少条 SEARCH / RELATED 的排序结果常驻内存,重复检索免打分(0 = 关闭)
+query_cache_capacity = 256
+# 文档缓存容量:最近读过多少条记忆记录常驻内存,避免重复解密存储页(0 = 关闭)
+doc_cache_capacity = 128
+# 打开库时按历史读取热度预加载进文档缓存的条数(优先加载热点,提高速度;0 = 不预加载)
+hot_preload = 32
 
 [tokenizer]
 # 每条记忆实际提取的关键词数(同时作为 SELECT 展示截断上限)
@@ -500,6 +516,64 @@ mod tests {
             };
             loaded.validate().unwrap();
         }
+    }
+
+    #[test]
+    fn cache_section_parses() {
+        let cfg = NebulaConfig::from_toml(
+            "[engine.cache]\nquery_cache_capacity = 8\ndoc_cache_capacity = 4\nhot_preload = 0\n",
+        )
+        .unwrap();
+        let k = cfg.engine.cache;
+        assert_eq!(k.query_cache_capacity, 8);
+        assert_eq!(k.doc_cache_capacity, 4);
+        assert_eq!(k.hot_preload, 0);
+        // 只给部分字段:其余回退内置默认
+        let cfg = NebulaConfig::from_toml("[engine.cache]\nhot_preload = 64\n").unwrap();
+        assert_eq!(cfg.engine.cache.hot_preload, 64);
+        assert_eq!(cfg.engine.cache.query_cache_capacity, 256);
+        assert_eq!(cfg.engine.cache.doc_cache_capacity, 128);
+    }
+
+    #[test]
+    fn validation_rejects_preload_without_doc_cache() {
+        // 文档缓存关闭时不允许预加载(没有缓存可加载)
+        let cfg =
+            NebulaConfig::from_toml("[engine.cache]\ndoc_cache_capacity = 0\nhot_preload = 32\n")
+                .unwrap();
+        let loaded = LoadedConfig {
+            config: cfg,
+            dir: PathBuf::from("."),
+            stopwords: HashSet::new(),
+        };
+        let err = loaded.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("engine.cache"),
+            "错误信息应带段前缀: {err}"
+        );
+        // 合法:两者同时为 0,或只关查询缓存 / 只关预加载
+        for ok in [
+            "[engine.cache]\ndoc_cache_capacity = 0\nhot_preload = 0\n",
+            "[engine.cache]\nhot_preload = 0\n",
+            "[engine.cache]\nquery_cache_capacity = 0\n",
+            "[engine.cache]\ndoc_cache_capacity = 1\nhot_preload = 64\n",
+        ] {
+            let cfg = NebulaConfig::from_toml(ok).unwrap();
+            let loaded = LoadedConfig {
+                config: cfg,
+                dir: PathBuf::from("."),
+                stopwords: HashSet::new(),
+            };
+            loaded.validate().unwrap();
+        }
+        // 只关文档缓存而不关预加载:hot_preload 回退默认 32 > 0,同样拒绝
+        let cfg = NebulaConfig::from_toml("[engine.cache]\ndoc_cache_capacity = 0\n").unwrap();
+        let loaded = LoadedConfig {
+            config: cfg,
+            dir: PathBuf::from("."),
+            stopwords: HashSet::new(),
+        };
+        assert!(loaded.validate().is_err());
     }
 
     #[test]

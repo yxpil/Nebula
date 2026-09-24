@@ -1,15 +1,16 @@
-//! 引擎内存索引:记录目录 + 关键词倒排 + 标签索引 + 检索统计。
+//! 引擎内存索引:记录目录 + 关键词倒排 + 标签索引 + 检索统计 + 读取热度。
 //!
 //! 这是"类 MySQL"检索的核心:
 //! - `records` 相当于聚簇索引(id → 物理行位置)
 //! - `postings` 相当于二级倒排索引(关键词 → 命中记录权重)
 //! - `tags` 相当于标签等值索引
-//! - `stats` 是 AI 检索基础(词频倒排/文档长度/共现图,见 [`crate::search`])
+//! - `stats` 是 AI 检索基础(词频/文档长度/共现图,见 [`crate::search`])
+//! - `heat` 是读取热度(读一次 +1,打开库时按热度预加载热点文档)
 //!
 //! 索引整体可序列化为快照,由 [`crate::database`] 负责在检查点时落盘。
 //! 快照布局:records / postings / tags 三段(旧版即到此为止),
-//! 之后追加第 4 段 `stats`;旧版快照加载时 `stats` 为空,
-//! 由 database 打开后扫描记录重建。
+//! 之后追加第 4 段 `stats`、第 5 段 `heat`;旧版快照加载时对应段为空,
+//! 其中 `stats` 由 database 打开后扫描记录重建,`heat` 从零累计即可。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -28,6 +29,8 @@ pub struct MemoryIndex {
     tags: BTreeMap<String, Vec<MemoryId>>,
     /// 检索统计(词频/文档长度/共现图),随快照持久化。
     stats: SearchStats,
+    /// id → 读取热度(每次读 +1;随快照持久化,打开库时用于热点预加载)。
+    heat: BTreeMap<MemoryId, u32>,
 }
 
 impl MemoryIndex {
@@ -81,7 +84,36 @@ impl MemoryIndex {
             !ids.is_empty()
         });
         self.stats.remove_doc(id);
+        self.heat.remove(&id);
         Some(loc)
+    }
+
+    // ------- 读取热度(打开库时按热度预加载热点文档)-------
+
+    /// 记录一次读取:该记忆的热度 +1(饱和加法,不会溢出)。
+    pub fn bump_heat(&mut self, id: MemoryId) {
+        let e = self.heat.entry(id).or_insert(0);
+        *e = e.saturating_add(1);
+    }
+
+    /// 热度最高的前 n 个 id(热度降序,同热度按 id 升序,结果可复现)。
+    pub fn hottest(&self, n: usize) -> Vec<MemoryId> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut all: Vec<(MemoryId, u32)> = self.heat.iter().map(|(id, h)| (*id, *h)).collect();
+        all.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        all.into_iter().take(n).map(|(id, _)| id).collect()
+    }
+
+    /// 某记忆的当前热度。
+    pub fn heat_of(&self, id: MemoryId) -> u32 {
+        self.heat.get(&id).copied().unwrap_or(0)
+    }
+
+    /// 有热度记录的文档数。
+    pub fn heat_len(&self) -> usize {
+        self.heat.len()
     }
 
     // ------- 检索统计委托(见 crate::search)-------
@@ -190,8 +222,8 @@ impl MemoryIndex {
 
     /// 编码为快照字节(records 与 postings 均按键/ id 有序,保证可复现)。
     ///
-    /// 布局:`records` / `postings` / `tags` / `stats`(检索统计)。
-    /// 前三段与旧版一致,`stats` 为追加段;加载时据此区分新旧快照。
+    /// 布局:`records` / `postings` / `tags` / `stats`(检索统计)/ `heat`(读取热度)。
+    /// 前三段与旧版一致,`stats`、`heat` 为追加段;加载时据此区分新旧快照。
     pub fn encode_snapshot(&self) -> Vec<u8> {
         let mut w = nebula_core::codec::Writer::new();
         // records: (id, head_page, page_count, encoded_len)
@@ -223,16 +255,23 @@ impl MemoryIndex {
         }
         // stats:检索统计(词频/文档长度/共现图)
         self.stats.encode(&mut w);
+        // heat:读取热度(id, 热度),按 id 升序
+        w.varint(self.heat.len() as u64);
+        for (id, heat) in &self.heat {
+            id.encode(&mut w);
+            w.varint(u64::from(*heat));
+        }
         w.into_vec()
     }
 
     /// 从快照字节恢复索引。
     ///
-    /// 返回 `(索引, 是否含检索统计段)`:旧版快照(三段)不含统计,
-    /// 调用方需在打开后扫描记录重建,否则 BM25 不可用。
-    pub fn load_snapshot(bytes: &[u8]) -> Result<(Self, bool)> {
+    /// 返回 `(索引, 是否含检索统计段, 是否含热度段)`:
+    /// - 旧版快照(三段)不含统计,调用方需在打开后扫描记录重建,否则 BM25 不可用;
+    /// - 旧版快照(四段,有统计无热度)的热度从零开始累计,不影响检索正确性。
+    pub fn load_snapshot(bytes: &[u8]) -> Result<(Self, bool, bool)> {
         if bytes.is_empty() {
-            return Ok((Self::new(), false));
+            return Ok((Self::new(), false, false));
         }
         let mut r = nebula_core::codec::Reader::new(bytes);
         let n = r.varint()? as usize;
@@ -277,6 +316,19 @@ impl MemoryIndex {
         } else {
             (SearchStats::new(), false)
         };
+        // heat 段:存在则解析;不存在(旧版快照)从零开始累计
+        let (heat, heat_present) = if r.remaining() > 0 {
+            let nh = r.varint()? as usize;
+            let mut map = BTreeMap::new();
+            for _ in 0..nh {
+                let id = r.u64()?;
+                let heat = r.varint()? as u32;
+                map.insert(id, heat);
+            }
+            (map, true)
+        } else {
+            (BTreeMap::new(), false)
+        };
         if r.remaining() != 0 {
             return Err(nebula_core::Error::Engine(
                 "index snapshot has trailing bytes".into(),
@@ -288,8 +340,10 @@ impl MemoryIndex {
                 postings,
                 tags,
                 stats,
+                heat,
             },
             stats_present,
+            heat_present,
         ))
     }
 }
@@ -340,9 +394,16 @@ mod tests {
             RecordLocation::new(5, 1, 8),
         );
 
+        // 热度:id 7 被读 3 次、id 1 被读 1 次,随后一起持久化
+        idx.bump_heat(1);
+        idx.bump_heat(7);
+        idx.bump_heat(7);
+        idx.bump_heat(7);
+
         let bytes = idx.encode_snapshot();
-        let (back, stats_present) = MemoryIndex::load_snapshot(&bytes).unwrap();
+        let (back, stats_present, heat_present) = MemoryIndex::load_snapshot(&bytes).unwrap();
         assert!(stats_present, "新版快照必须带 stats 段");
+        assert!(heat_present, "新版快照必须带 heat 段");
 
         assert_eq!(back.len(), 3);
         assert_eq!(back.keyword_hits("rust"), vec![(1, 0.9), (5, 0.7)]);
@@ -357,6 +418,11 @@ mod tests {
         let q = vec![("rust".to_string(), 1.0f32)];
         let expanded = back.expand(&q, &crate::config::SearchConfig::default());
         assert!(expanded.iter().any(|(t, _)| t == "内存"));
+        // 热度恢复:7(3 次) hottest,其次 1(1 次);无热度的 5 不在热度表内
+        assert_eq!(back.hottest(3), vec![7, 1]);
+        assert_eq!(back.heat_of(7), 3);
+        assert_eq!(back.heat_of(5), 0);
+        assert_eq!(back.heat_len(), 2);
     }
 
     #[test]
@@ -386,13 +452,17 @@ mod tests {
         1u64.encode(&mut w);
         let legacy = w.into_vec();
 
-        let (back, stats_present) = MemoryIndex::load_snapshot(&legacy).unwrap();
+        let (back, stats_present, heat_present) = MemoryIndex::load_snapshot(&legacy).unwrap();
         assert!(!stats_present, "旧版快照应标记为无 stats");
+        assert!(!heat_present, "旧版快照应标记为无 heat");
         assert_eq!(back.len(), 1);
         assert_eq!(back.keyword_hits("rust"), vec![(1, 0.9)]);
         // stats 为空 → BM25 无候选(等待调用方重建)
         assert_eq!(back.stats_doc_count(), 0);
         assert!(back.docs_with_terms(["rust"]).is_empty());
+        // 热度从零开始,不影响检索
+        assert_eq!(back.heat_len(), 0);
+        assert_eq!(back.hottest(5), Vec::<MemoryId>::new());
         // 旧索引仍可参与新快照:set_doc_stats 后恢复检索能力
         let mut back = back;
         back.set_doc_stats(1, &tf(&[("rust", 1)]), &[("rust".to_string(), 0.9f32)]);
@@ -427,9 +497,79 @@ mod tests {
     }
 
     #[test]
+    fn legacy_snapshot_with_stats_without_heat_loads() {
+        // 旧版四段快照:records + postings + tags + stats(有统计,无 heat)
+        let mut idx = MemoryIndex::new();
+        idx.upsert(
+            &rec(1, &[("rust", 0.9)], &["编程"]),
+            &tf(&[("rust", 1)]),
+            RecordLocation::new(2, 1, 10),
+        );
+        let mut w = Writer::new();
+        w.varint(1);
+        1u64.encode(&mut w);
+        2u64.encode(&mut w);
+        1u32.encode(&mut w);
+        10u64.encode(&mut w);
+        w.varint(1);
+        w.str("rust");
+        w.varint(1);
+        1u64.encode(&mut w);
+        0.9f32.encode(&mut w);
+        w.varint(1);
+        w.str("编程");
+        w.varint(1);
+        1u64.encode(&mut w);
+        // stats 段直接取当前索引内部的统计(有数据),但不写 heat 段
+        idx.stats.encode(&mut w);
+        let legacy = w.into_vec();
+
+        let (back, stats_present, heat_present) = MemoryIndex::load_snapshot(&legacy).unwrap();
+        assert!(stats_present, "四段快照含 stats");
+        assert!(!heat_present, "四段快照无 heat");
+        assert_eq!(back.len(), 1);
+        // 检索能力完整恢复
+        assert_eq!(back.stats_doc_count(), 1);
+        assert!(back.docs_with_terms(["rust"]).contains(&1));
+        // 热度从零开始(不影响检索正确性)
+        assert_eq!(back.heat_len(), 0);
+    }
+
+    #[test]
+    fn remove_cleans_heat() {
+        let mut idx = MemoryIndex::new();
+        idx.upsert(
+            &rec(1, &[("rust", 0.9)], &["t"]),
+            &tf(&[("rust", 1)]),
+            RecordLocation::new(2, 1, 1),
+        );
+        idx.bump_heat(1);
+        idx.bump_heat(1);
+        assert_eq!(idx.heat_of(1), 2);
+        idx.remove(1);
+        assert_eq!(idx.heat_len(), 0);
+        assert_eq!(idx.heat_of(1), 0);
+    }
+
+    #[test]
+    fn hottest_orders_by_heat_then_id() {
+        let mut idx = MemoryIndex::new();
+        for id in 1..=4 {
+            idx.bump_heat(id);
+        }
+        idx.bump_heat(3);
+        idx.bump_heat(3);
+        // 热度降序、同热度 id 升序;n=0 返回空
+        assert_eq!(idx.hottest(0), Vec::<MemoryId>::new());
+        assert_eq!(idx.hottest(2), vec![3, 1]);
+        assert_eq!(idx.hottest(10), vec![3, 1, 2, 4]);
+    }
+
+    #[test]
     fn empty_snapshot_loads_empty_index() {
-        let (idx, stats_present) = MemoryIndex::load_snapshot(&[]).unwrap();
+        let (idx, stats_present, heat_present) = MemoryIndex::load_snapshot(&[]).unwrap();
         assert!(idx.is_empty());
         assert!(!stats_present);
+        assert!(!heat_present);
     }
 }

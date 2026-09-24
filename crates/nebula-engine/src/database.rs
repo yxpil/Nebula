@@ -10,7 +10,13 @@
 //! - DELETE / UPDATE 立即写快照(索引条目即时变化,防止重开后复活)
 //! - 关闭时自动 CHECKPOINT,然后 fsync
 //!
-//! 所有行为参数(检查点阈值、内容/关键词/关键点上限、分词与停用词)
+//! 缓存策略(重复检索免打分、重复读取免解密,见 [`crate::cache`]):
+//! - 查询缓存 SEARCH / RELATED 的排序结果;写操作(INSERT/UPDATE/DELETE)
+//!   后整体失效(BM25 的 df / avgdl 随写入改变,旧结果不再可信);
+//! - 文档缓存 LRU 保存读过的记录,写路径同步 fill / evict;
+//! - 打开库时按历史读取热度(随索引快照持久化)预加载热点文档。
+//!
+//! 所有行为参数(检查点阈值、内容/关键词/关键点上限、分词与停用词、缓存容量)
 //! 通过 [`crate::EngineConfig`] 与停用词集合注入,本 crate 不读取配置文件。
 
 use std::collections::{BTreeMap, HashSet};
@@ -23,6 +29,7 @@ use nebula_tokenizer::{default_stopword_set, ExtractorConfig, TextExtractor};
 
 use nebula_storage::MemoryFile;
 
+use crate::cache::{DocCache, QueryCache};
 use crate::config::EngineConfig;
 use crate::index::MemoryIndex;
 
@@ -32,6 +39,10 @@ pub struct Database {
     pub(crate) index: MemoryIndex,
     pub(crate) extractor: TextExtractor,
     pub(crate) cfg: EngineConfig,
+    /// SEARCH / RELATED 排序结果缓存(写操作后整体失效)。
+    pub(crate) query_cache: QueryCache,
+    /// 记忆记录 LRU 缓存(读路径自动填充,写路径同步维护)。
+    pub(crate) doc_cache: DocCache,
 }
 
 impl Database {
@@ -48,6 +59,9 @@ impl Database {
     }
 
     /// 打开已存在的记忆库,注入引擎配置、提取配置与停用词表。
+    ///
+    /// 打开后按历史读取热度把最热的 `engine.cache.hot_preload` 条记忆
+    /// 预加载进文档缓存(无热度数据的旧库自然从零开始累计)。
     pub fn open_configured(
         path: impl AsRef<Path>,
         password: &str,
@@ -58,19 +72,23 @@ impl Database {
         let path = path.as_ref().to_path_buf();
         let mut file = MemoryFile::open(&path, password)?;
         let snap = file.read_index_snapshot()?;
-        let (index, stats_present) = MemoryIndex::load_snapshot(&snap)?;
+        let (index, stats_present, _heat_present) = MemoryIndex::load_snapshot(&snap)?;
         let mut db = Database {
             path,
             file,
             index,
             extractor: TextExtractor::new(extractor_cfg.clone(), stopwords.clone()),
             cfg: cfg.clone(),
+            query_cache: QueryCache::new(cfg.cache.query_cache_capacity),
+            doc_cache: DocCache::new(cfg.cache.doc_cache_capacity),
         };
         if !stats_present {
             // 旧版(三段)快照没有检索统计:扫描全部记录重建,
             // 保证 SEARCH / RELATED 对旧库立即可用(之后检查点会持久化)。
             db.rebuild_term_stats()?;
         }
+        // 热点预加载:按历史读取热度填充文档缓存,首次查询即可命中。
+        db.preload_hot_docs()?;
         Ok(db)
     }
 
@@ -103,6 +121,8 @@ impl Database {
             index: MemoryIndex::new(),
             extractor: TextExtractor::new(extractor_cfg.clone(), stopwords.clone()),
             cfg: cfg.clone(),
+            query_cache: QueryCache::new(cfg.cache.query_cache_capacity),
+            doc_cache: DocCache::new(cfg.cache.doc_cache_capacity),
         })
     }
 
@@ -148,19 +168,30 @@ impl Database {
         self.file.set_memory_count(self.index.len() as u64);
         self.file.commit_catalog()?;
 
+        // 缓存维护:新记录 fill 文档缓存;写操作使 BM25 的 df / avgdl 变化,
+        // 查询缓存必须整体失效,否则旧排序不再可信。
+        self.doc_cache.put(record.id, record.clone());
+        self.query_cache.invalidate();
+
         if self.file.dirty_records() >= self.cfg.auto_checkpoint {
             self.checkpoint()?;
         }
         Ok(record.id)
     }
 
-    /// 读取一条记忆(经索引定位)。
+    /// 读取一条记忆(经索引定位);命中文档缓存则免去解密读页,并累计读取热度。
     pub(crate) fn fetch_record(&mut self, id: MemoryId) -> Result<Option<MemoryRecord>> {
         let Some(loc) = self.index.location(id).copied() else {
             return Ok(None);
         };
+        if let Some(rec) = self.doc_cache.get(id) {
+            self.index.bump_heat(id);
+            return Ok(Some(rec));
+        }
         let bytes = self.file.read_record(&loc)?;
         let record: MemoryRecord = codec::from_slice(&bytes)?;
+        self.doc_cache.put(id, record.clone());
+        self.index.bump_heat(id);
         Ok(Some(record))
     }
 
@@ -179,6 +210,9 @@ impl Database {
         self.file.set_memory_count(self.index.len() as u64);
         self.file.commit_catalog()?;
         // 索引位置已变,必须重写快照,否则重开后索引会指向旧页。
+        // 缓存维护:文档缓存 fill 新记录;查询缓存整体失效。
+        self.doc_cache.put(record.id, record.clone());
+        self.query_cache.invalidate();
         self.checkpoint()?;
         Ok(())
     }
@@ -189,12 +223,14 @@ impl Database {
         for id in ids {
             if let Some(loc) = self.index.remove(*id) {
                 self.file.free_record(&loc)?;
+                self.doc_cache.evict(*id);
                 removed += 1;
             }
         }
         if removed > 0 {
             self.file.set_memory_count(self.index.len() as u64);
             self.file.commit_catalog()?;
+            self.query_cache.invalidate();
             self.checkpoint()?;
         }
         Ok(removed)
@@ -228,6 +264,22 @@ impl Database {
         }
         for (id, terms, kws) in docs {
             self.index.set_doc_stats(id, &terms, &kws);
+        }
+        Ok(())
+    }
+
+    /// 打开库后按读取热度预加载热点文档进文档缓存。
+    ///
+    /// `engine.cache.hot_preload = 0` 或文档缓存关闭时不预加载。
+    /// 按热度**升序**插入,保证容量不足时最热的文档最终留在缓存里。
+    fn preload_hot_docs(&mut self) -> Result<()> {
+        let n = self.cfg.cache.hot_preload;
+        if n == 0 {
+            return Ok(());
+        }
+        let hot = self.index.hottest(n);
+        for id in hot.into_iter().rev() {
+            self.fetch_record(id)?;
         }
         Ok(())
     }

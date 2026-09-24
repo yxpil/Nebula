@@ -6,17 +6,21 @@
 //! RELATED TO <id> | RELATED '文本' [LIMIT n]
 //! UPDATE memories SET 列=值[,...] [WHERE ...]
 //! DELETE FROM memories [WHERE ...]
-//! CHECKPOINT / SHOW TABLES / SHOW STATUS
+//! SHOW TABLES | SHOW STATUS | SHOW CACHE | SHOW HOT [LIMIT n]
+//! CLEAR CACHE
+//! SET CACHE query|doc <n>
+//! CHECKPOINT
 //! ```
 //! WHERE 条件:`id = n` / `keyword = '词'` / `tag = '标签'` /
 //! `content LIKE '%子串%'` / `importance > 0.5`,支持 AND / OR / NOT 与括号。
 //! SEARCH / RELATED 是 AI 记忆检索语句:分词后走 BM25 打分与共现图联想。
+//! SHOW CACHE / CLEAR CACHE / SHOW HOT / SET CACHE 是缓存管理语句。
 
 use nebula_core::{Error, Result};
 
 use crate::ast::{
-    CmpOp, DeleteStmt, Expr, InsertStmt, Literal, OrderBy, RelatedSeed, RelatedStmt, SearchStmt,
-    SelectColumn, SelectStmt, Statement, UpdateStmt,
+    CacheTarget, CmpOp, DeleteStmt, Expr, InsertStmt, Literal, OrderBy, RelatedSeed, RelatedStmt,
+    SearchStmt, SelectColumn, SelectStmt, SetCacheStmt, ShowHotStmt, Statement, UpdateStmt,
 };
 use crate::lexer::Token;
 
@@ -129,6 +133,8 @@ impl Parser {
             "related" => self.related_stmt(),
             "delete" => self.delete_stmt(),
             "update" => self.update_stmt(),
+            "clear" => self.clear_stmt(),
+            "set" => self.set_stmt(),
             "checkpoint" => {
                 self.next();
                 Ok(Statement::Checkpoint)
@@ -191,9 +197,48 @@ impl Parser {
             Ok(Statement::ShowTables)
         } else if self.eat_word("status") {
             Ok(Statement::ShowStatus)
+        } else if self.eat_word("cache") {
+            Ok(Statement::ShowCache)
+        } else if self.eat_word("hot") {
+            Ok(Statement::ShowHot(ShowHotStmt {
+                limit: self.optional_limit()?,
+            }))
         } else {
-            Err(Error::Sql("SHOW supports TABLES or STATUS".into()))
+            Err(Error::Sql(
+                "SHOW supports TABLES, STATUS, CACHE or HOT [LIMIT n]".into(),
+            ))
         }
+    }
+
+    /// CLEAR CACHE:清空查询缓存。
+    fn clear_stmt(&mut self) -> Result<Statement> {
+        self.expect_word("clear")?;
+        self.expect_word("cache")?;
+        Ok(Statement::ClearCache)
+    }
+
+    /// SET CACHE query|doc <n>:在线调整缓存容量。
+    fn set_stmt(&mut self) -> Result<Statement> {
+        self.expect_word("set")?;
+        self.expect_word("cache")?;
+        let target = match self.next() {
+            Token::Word(w) if w == "query" => CacheTarget::Query,
+            Token::Word(w) if w == "doc" => CacheTarget::Doc,
+            other => {
+                return Err(Error::Sql(format!(
+                    "SET CACHE expects target 'query' or 'doc', got {other:?}"
+                )))
+            }
+        };
+        let capacity = match self.next() {
+            Token::Int(n) if n >= 0 => n as usize,
+            other => {
+                return Err(Error::Sql(format!(
+                    "SET CACHE capacity expects a non-negative int, got {other:?}"
+                )))
+            }
+        };
+        Ok(Statement::SetCache(SetCacheStmt { target, capacity }))
     }
 
     // ------- INSERT -------
@@ -667,6 +712,63 @@ mod tests {
         assert!(p("RELATED TO -1").is_err());
         assert!(p("RELATED TO").is_err());
         assert!(p("RELATED 7").is_err());
+    }
+
+    #[test]
+    fn cache_statements() {
+        assert_eq!(p("SHOW CACHE").unwrap(), Statement::ShowCache);
+        assert_eq!(p("show cache;").unwrap(), Statement::ShowCache);
+        assert_eq!(p("CLEAR CACHE").unwrap(), Statement::ClearCache);
+        assert_eq!(p("clear cache;").unwrap(), Statement::ClearCache);
+        assert_eq!(p("SHOW HOT").unwrap(), Statement::ShowHot(ShowHotStmt { limit: None }));
+        match p("show hot limit 5;").unwrap() {
+            Statement::ShowHot(s) => assert_eq!(s.limit, Some(5)),
+            _ => panic!("wrong statement"),
+        }
+        match p("SET CACHE query 128").unwrap() {
+            Statement::SetCache(s) => {
+                assert_eq!(s.target, CacheTarget::Query);
+                assert_eq!(s.capacity, 128);
+            }
+            _ => panic!("wrong statement"),
+        }
+        match p("set cache doc 0").unwrap() {
+            Statement::SetCache(s) => {
+                assert_eq!(s.target, CacheTarget::Doc);
+                assert_eq!(s.capacity, 0);
+            }
+            _ => panic!("wrong statement"),
+        }
+        // 语句类型名
+        assert_eq!(Statement::ShowCache.kind(), "show-cache");
+        assert_eq!(Statement::ClearCache.kind(), "clear-cache");
+        assert_eq!(
+            Statement::ShowHot(ShowHotStmt { limit: None }).kind(),
+            "show-hot"
+        );
+        assert_eq!(
+            Statement::SetCache(SetCacheStmt {
+                target: CacheTarget::Query,
+                capacity: 1
+            })
+            .kind(),
+            "set-cache"
+        );
+    }
+
+    #[test]
+    fn cache_statement_errors() {
+        assert!(p("SHOW").is_err());
+        assert!(p("SHOW HOT 5").is_err(), "SHOW HOT 的条数必须带 LIMIT");
+        assert!(p("CLEAR").is_err());
+        assert!(p("CLEAR CACHES").is_err());
+        assert!(p("SET").is_err());
+        assert!(p("SET CACHE").is_err());
+        assert!(p("SET CACHE hot 10").is_err(), "hot 不是缓存目标");
+        assert!(p("SET CACHE query -1").is_err());
+        assert!(p("SET CACHE query 1.5").is_err());
+        assert!(p("SET CACHE query").is_err());
+        assert!(p("SET CACHE query 10 extra").is_err());
     }
 
     #[test]

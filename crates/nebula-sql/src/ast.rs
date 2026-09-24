@@ -13,6 +13,14 @@ pub enum Statement {
     Search(SearchStmt),
     /// RELATED TO <id> [LIMIT n] / RELATED '文本' [LIMIT n] —— 联想推荐。
     Related(RelatedStmt),
+    /// SHOW CACHE —— 查询缓存 / 文档缓存的容量与命中统计。
+    ShowCache,
+    /// CLEAR CACHE —— 清空查询缓存并清零计数。
+    ClearCache,
+    /// SHOW HOT [LIMIT n] —— 按读取热度展示记忆。
+    ShowHot(ShowHotStmt),
+    /// SET CACHE query|doc <n> —— 在线调整缓存容量。
+    SetCache(SetCacheStmt),
     Checkpoint,
     ShowTables,
     ShowStatus,
@@ -42,6 +50,30 @@ pub struct RelatedStmt {
     pub seed: RelatedSeed,
     /// 返回条数上限(None 时用配置默认值)。
     pub limit: Option<usize>,
+}
+
+/// SHOW HOT 语句:按读取热度展示记忆 + 可选条数上限。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShowHotStmt {
+    /// 展示条数上限(None 时用检索默认条数)。
+    pub limit: Option<usize>,
+}
+
+/// SET CACHE 的调整目标。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheTarget {
+    /// 查询缓存(SEARCH / RELATED 排序结果)。
+    Query,
+    /// 文档缓存(记忆记录 LRU)。
+    Doc,
+}
+
+/// SET CACHE 语句:在线调整某一层缓存的容量。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetCacheStmt {
+    pub target: CacheTarget,
+    /// 新容量(0 = 关闭对应缓存)。
+    pub capacity: usize,
 }
 
 /// INSERT INTO memories [(列...)] VALUES (值...)
@@ -148,6 +180,10 @@ impl Statement {
             Statement::Update(_) => "update",
             Statement::Search(_) => "search",
             Statement::Related(_) => "related",
+            Statement::ShowCache => "show-cache",
+            Statement::ClearCache => "clear-cache",
+            Statement::ShowHot(_) => "show-hot",
+            Statement::SetCache(_) => "set-cache",
             Statement::Checkpoint => "checkpoint",
             Statement::ShowTables => "show tables",
             Statement::ShowStatus => "show status",
