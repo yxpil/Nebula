@@ -239,6 +239,45 @@ impl LoadedConfig {
                 "engine.max_content_len must be >= 1".into(),
             ));
         }
+        let s = &c.engine.search;
+        if !s.k1.is_finite() || s.k1 < 0.0 {
+            return Err(Error::Config(
+                "engine.search.k1 must be a finite number >= 0".into(),
+            ));
+        }
+        if !s.b.is_finite() || !(0.0..=1.0).contains(&s.b) {
+            return Err(Error::Config(
+                "engine.search.b must be a finite number in 0.0..=1.0".into(),
+            ));
+        }
+        if s.hops > 2 {
+            return Err(Error::Config("engine.search.hops must be 0..=2".into()));
+        }
+        if s.expansion_limit == 0 {
+            return Err(Error::Config(
+                "engine.search.expansion_limit must be >= 1".into(),
+            ));
+        }
+        if !s.expansion_decay.is_finite() || !(0.0..=1.0).contains(&s.expansion_decay) {
+            return Err(Error::Config(
+                "engine.search.expansion_decay must be a finite number in 0.0..=1.0".into(),
+            ));
+        }
+        if !s.similarity_weight.is_finite() || s.similarity_weight < 0.0 {
+            return Err(Error::Config(
+                "engine.search.similarity_weight must be a finite number >= 0".into(),
+            ));
+        }
+        if !s.min_score.is_finite() || s.min_score < 0.0 {
+            return Err(Error::Config(
+                "engine.search.min_score must be a finite number >= 0".into(),
+            ));
+        }
+        if s.default_limit == 0 {
+            return Err(Error::Config(
+                "engine.search.default_limit must be >= 1".into(),
+            ));
+        }
         if c.tokenizer.extract.max_keywords == 0 || c.tokenizer.extract.max_key_points == 0 {
             return Err(Error::Config(
                 "tokenizer.max_keywords / max_key_points must be >= 1".into(),
@@ -312,6 +351,24 @@ auto_checkpoint = 1000
 # 单条记忆内容上限(字符数)
 max_content_len = 1048576
 
+[engine.search]
+# BM25 词频饱和参数 k1(0 = 完全不看词频,1.2 为经典默认)
+k1 = 1.2
+# BM25 文档长度归一化强度 b(0 = 不归一化,1 = 完全归一化)
+b = 0.75
+# 共现图查询扩展跳数(0 = 关闭联想扩展,1 ~ 2)
+hops = 1
+# 每个查询最多引入的扩展词数(按共现权重取前 N)
+expansion_limit = 8
+# 扩展词权重衰减:每多一跳,权重乘以该系数
+expansion_decay = 0.5
+# 联合重排中种子相似度(余弦)的权重(0 = 只用 BM25)
+similarity_weight = 0.5
+# 相关度下限:低于该分数的结果不返回(0 = 不过滤)
+min_score = 0.0
+# SEARCH / RELATED 未显式 LIMIT 时的默认返回条数
+default_limit = 10
+
 [tokenizer]
 # 每条记忆实际提取的关键词数(同时作为 SELECT 展示截断上限)
 max_keywords = 16
@@ -380,6 +437,69 @@ mod tests {
         assert_eq!(cfg.storage.page_size, NebulaConfig::default().storage.page_size);
         assert_eq!(cfg.tokenizer.extract, ExtractorConfig::default());
         assert_eq!(cfg.cli.prompt, "nebula> ");
+    }
+
+    #[test]
+    fn search_section_parses() {
+        let cfg = NebulaConfig::from_toml(
+            "[engine.search]\nk1 = 2.0\nb = 0.5\nhops = 2\nexpansion_limit = 3\n\
+             expansion_decay = 0.25\nsimilarity_weight = 1.5\nmin_score = 0.1\ndefault_limit = 5\n",
+        )
+        .unwrap();
+        let s = cfg.engine.search;
+        assert_eq!((s.k1, s.b), (2.0, 0.5));
+        assert_eq!(s.hops, 2);
+        assert_eq!(s.expansion_limit, 3);
+        assert_eq!(s.expansion_decay, 0.25);
+        assert_eq!(s.similarity_weight, 1.5);
+        assert_eq!(s.min_score, 0.1);
+        assert_eq!(s.default_limit, 5);
+        // 只给部分字段:其余回退内置默认
+        let cfg = NebulaConfig::from_toml("[engine.search]\nhops = 0\n").unwrap();
+        assert_eq!(cfg.engine.search.hops, 0);
+        assert_eq!(cfg.engine.search.k1, 1.2);
+        assert_eq!(cfg.engine.search.b, 0.75);
+    }
+
+    #[test]
+    fn validation_rejects_bad_search_values() {
+        let bad = [
+            "k1 = -0.5",
+            "b = 1.5",
+            "b = -0.1",
+            "hops = 3",
+            "expansion_limit = 0",
+            "expansion_decay = 1.5",
+            "similarity_weight = -1.0",
+            "min_score = -0.01",
+            "default_limit = 0",
+        ];
+        for kv in bad {
+            let cfg = NebulaConfig::from_toml(&format!("[engine.search]\n{kv}\n")).unwrap();
+            let loaded = LoadedConfig {
+                config: cfg,
+                dir: PathBuf::from("."),
+                stopwords: HashSet::new(),
+            };
+            let err = loaded.validate().unwrap_err().to_string();
+            assert!(err.contains("engine.search"), "'{kv}' 的错误信息应带段前缀: {err}");
+        }
+        // 边界合法值:hops = 0(关闭扩展)、k1 = 0、min_score = 0、default_limit = 1
+        for ok in [
+            "[engine.search]\nhops = 0\n",
+            "[engine.search]\nk1 = 0\n",
+            "[engine.search]\nb = 1.0\n",
+            "[engine.search]\nmin_score = 0\n",
+            "[engine.search]\ndefault_limit = 1\n",
+        ] {
+            let cfg = NebulaConfig::from_toml(ok).unwrap();
+            let loaded = LoadedConfig {
+                config: cfg,
+                dir: PathBuf::from("."),
+                stopwords: HashSet::new(),
+            };
+            loaded.validate().unwrap();
+        }
     }
 
     #[test]

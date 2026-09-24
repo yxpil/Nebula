@@ -1,5 +1,7 @@
 //! SQL AST 定义(MySQL 风格子集,单表 `memories`)。
 
+use nebula_core::MemoryId;
+
 /// 顶层语句。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
@@ -7,9 +9,39 @@ pub enum Statement {
     Select(SelectStmt),
     Delete(DeleteStmt),
     Update(UpdateStmt),
+    /// SEARCH '自然语言查询' [LIMIT n] —— BM25 相关性检索。
+    Search(SearchStmt),
+    /// RELATED TO <id> [LIMIT n] / RELATED '文本' [LIMIT n] —— 联想推荐。
+    Related(RelatedStmt),
     Checkpoint,
     ShowTables,
     ShowStatus,
+}
+
+/// SEARCH 语句:自然语言查询 + 可选条数上限。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchStmt {
+    /// 查询文本(分词后进入 BM25 打分)。
+    pub query: String,
+    /// 返回条数上限(None 时用配置默认值)。
+    pub limit: Option<usize>,
+}
+
+/// RELATED 语句的种子来源。
+#[derive(Debug, Clone, PartialEq)]
+pub enum RelatedSeed {
+    /// 以某条已有记忆为种子。
+    Id(MemoryId),
+    /// 以自由文本/关键词为种子。
+    Text(String),
+}
+
+/// RELATED 语句:联想推荐 + 可选条数上限。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelatedStmt {
+    pub seed: RelatedSeed,
+    /// 返回条数上限(None 时用配置默认值)。
+    pub limit: Option<usize>,
 }
 
 /// INSERT INTO memories [(列...)] VALUES (值...)
@@ -114,6 +146,8 @@ impl Statement {
             Statement::Select(_) => "select",
             Statement::Delete(_) => "delete",
             Statement::Update(_) => "update",
+            Statement::Search(_) => "search",
+            Statement::Related(_) => "related",
             Statement::Checkpoint => "checkpoint",
             Statement::ShowTables => "show tables",
             Statement::ShowStatus => "show status",

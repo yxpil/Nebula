@@ -2,18 +2,21 @@
 //! ```sql
 //! INSERT INTO memories [(content,tags,source,importance)] VALUES (...)
 //! SELECT [*|列,...] FROM memories [WHERE 条件] [ORDER BY 列 [ASC|DESC]] [LIMIT n]
-//! UPDATE memories SET 列=值[,...] [WHERE 条件]
-//! DELETE FROM memories [WHERE 条件]
+//! SEARCH '自然语言查询' [LIMIT n]
+//! RELATED TO <id> | RELATED '文本' [LIMIT n]
+//! UPDATE memories SET 列=值[,...] [WHERE ...]
+//! DELETE FROM memories [WHERE ...]
 //! CHECKPOINT / SHOW TABLES / SHOW STATUS
 //! ```
 //! WHERE 条件:`id = n` / `keyword = '词'` / `tag = '标签'` /
 //! `content LIKE '%子串%'` / `importance > 0.5`,支持 AND / OR / NOT 与括号。
+//! SEARCH / RELATED 是 AI 记忆检索语句:分词后走 BM25 打分与共现图联想。
 
 use nebula_core::{Error, Result};
 
 use crate::ast::{
-    CmpOp, DeleteStmt, Expr, InsertStmt, Literal, OrderBy, SelectColumn, SelectStmt, Statement,
-    UpdateStmt,
+    CmpOp, DeleteStmt, Expr, InsertStmt, Literal, OrderBy, RelatedSeed, RelatedStmt, SearchStmt,
+    SelectColumn, SelectStmt, Statement, UpdateStmt,
 };
 use crate::lexer::Token;
 
@@ -122,6 +125,8 @@ impl Parser {
         match word.as_str() {
             "insert" => self.insert_stmt(),
             "select" => self.select_stmt(),
+            "search" => self.search_stmt(),
+            "related" => self.related_stmt(),
             "delete" => self.delete_stmt(),
             "update" => self.update_stmt(),
             "checkpoint" => {
@@ -131,6 +136,53 @@ impl Parser {
             "show" => self.show_stmt(),
             other => Err(Error::Sql(format!("unsupported statement '{other}'"))),
         }
+    }
+
+    // ------- SEARCH / RELATED(AI 检索)-------
+
+    /// SEARCH '查询文本' [LIMIT n]
+    fn search_stmt(&mut self) -> Result<Statement> {
+        self.expect_word("search")?;
+        let query = match self.next() {
+            Token::Str(s) if !s.trim().is_empty() => s,
+            other => {
+                return Err(Error::Sql(format!(
+                    "SEARCH expects a quoted query string, got {other:?}"
+                )))
+            }
+        };
+        Ok(Statement::Search(SearchStmt {
+            query,
+            limit: self.optional_limit()?,
+        }))
+    }
+
+    /// RELATED TO <id> | RELATED '文本' [LIMIT n]
+    fn related_stmt(&mut self) -> Result<Statement> {
+        self.expect_word("related")?;
+        let seed = if self.eat_word("to") {
+            match self.next() {
+                Token::Int(n) if n >= 0 => RelatedSeed::Id(n as u64),
+                other => {
+                    return Err(Error::Sql(format!(
+                        "RELATED TO expects a non-negative memory id, got {other:?}"
+                    )))
+                }
+            }
+        } else {
+            match self.next() {
+                Token::Str(s) if !s.trim().is_empty() => RelatedSeed::Text(s),
+                other => {
+                    return Err(Error::Sql(format!(
+                        "RELATED expects TO <id> or a quoted seed text, got {other:?}"
+                    )))
+                }
+            }
+        };
+        Ok(Statement::Related(RelatedStmt {
+            seed,
+            limit: self.optional_limit()?,
+        }))
     }
 
     fn show_stmt(&mut self) -> Result<Statement> {
@@ -563,6 +615,58 @@ mod tests {
         assert_eq!(p("CHECKPOINT").unwrap(), Statement::Checkpoint);
         assert_eq!(p("SHOW TABLES").unwrap(), Statement::ShowTables);
         assert_eq!(p("show status;").unwrap(), Statement::ShowStatus);
+    }
+
+    #[test]
+    fn search_statement() {
+        let s = p("SEARCH 'Rust 内存安全' LIMIT 5").unwrap();
+        match s {
+            Statement::Search(s) => {
+                assert_eq!(s.query, "Rust 内存安全");
+                assert_eq!(s.limit, Some(5));
+            }
+            _ => panic!("wrong statement"),
+        }
+        // 大小写不敏感、LIMIT 可选、结尾分号允许
+        let s = p("search 'borrow checker';").unwrap();
+        match s {
+            Statement::Search(s) => {
+                assert_eq!(s.query, "borrow checker");
+                assert_eq!(s.limit, None);
+            }
+            _ => panic!("wrong statement"),
+        }
+    }
+
+    #[test]
+    fn related_statement() {
+        let s = p("RELATED TO 42 LIMIT 3").unwrap();
+        match s {
+            Statement::Related(r) => {
+                assert_eq!(r.seed, RelatedSeed::Id(42));
+                assert_eq!(r.limit, Some(3));
+            }
+            _ => panic!("wrong statement"),
+        }
+        let s = p("RELATED '所有权 生命周期'").unwrap();
+        match s {
+            Statement::Related(r) => {
+                assert_eq!(r.seed, RelatedSeed::Text("所有权 生命周期".into()));
+                assert_eq!(r.limit, None);
+            }
+            _ => panic!("wrong statement"),
+        }
+    }
+
+    #[test]
+    fn search_related_errors() {
+        assert!(p("SEARCH 'rust' 'extra'").is_err());
+        assert!(p("SEARCH 42").is_err());
+        assert!(p("SEARCH 'rust' LIMIT -1").is_err());
+        assert!(p("RELATED").is_err());
+        assert!(p("RELATED TO -1").is_err());
+        assert!(p("RELATED TO").is_err());
+        assert!(p("RELATED 7").is_err());
     }
 
     #[test]

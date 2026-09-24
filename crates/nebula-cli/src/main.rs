@@ -73,8 +73,9 @@ fn print_help() {
   -h, --help        显示本帮助
 
 配置:
-  create 时自动生成 nebula.toml(页大小/检查点/上限/分词/停用词/默认地址/展示/密码策略)
+  create 时自动生成 nebula.toml(页大小/检查点/上限/分词/停用词/检索联想/默认地址/展示/密码策略)
   与 stopwords.txt(停用词表),手工编辑后对下一次 open/serve 生效。
+  检索与联想相关参数在 [engine.search] 段(BM25 k1/b、联想跳数、扩展衰减、相似度权重等)。
 
 其他:
   NEBULA_PASSWORD   环境变量提供密码(跳过终端输入,便于脚本)",

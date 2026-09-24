@@ -1,15 +1,19 @@
-//! SQL 语句执行:INSERT / SELECT / DELETE / UPDATE / 元语句。
+//! SQL 语句执行:INSERT / SELECT / DELETE / UPDATE / SEARCH / RELATED / 元语句。
 //!
 //! 检索策略(类 MySQL 的"索引优先,退化全表扫描"):
 //! - `keyword =` / `tag =` / `id =` 走内存索引;
 //! - 含 `content LIKE` / `importance >` / `source =` 的条件退化为记录扫描;
 //! - AND/OR/NOT 组合在候选集上做布尔运算。
+//!
+//! AI 检索(SEARCH / RELATED)走 [`crate::search`] 的三层模型:
+//! BM25 打分 → 共现图查询扩展 → 种子相似度联合重排。
 
 use std::collections::BTreeSet;
 
-use nebula_core::{MemoryId, MemoryRecord, Result};
-use nebula_sql::ast::{CmpOp, Expr, Literal, SelectColumn, Statement};
+use nebula_core::{Keyword, MemoryId, MemoryRecord, Result};
+use nebula_sql::ast::{CmpOp, Expr, Literal, RelatedSeed, SearchStmt, SelectColumn, Statement};
 
+use crate::config::SearchConfig;
 use crate::database::Database;
 use crate::format::{
     fmt_importance, fmt_key_points, fmt_keywords, fmt_tags, fmt_time, keywords_inline,
@@ -29,6 +33,9 @@ const KNOWN_COLUMNS: &[&str] = &[
     "created_at",
     "updated_at",
 ];
+
+/// SEARCH / RELATED 结果列(含相关度分数)。
+const RANKED_COLUMNS: &[&str] = &["id", "score", "content", "keywords", "tags", "importance"];
 
 /// 语句执行结果。
 #[derive(Debug, Clone)]
@@ -50,6 +57,22 @@ impl QueryResult {
             affected: 0,
         }
     }
+
+    /// 空的检索结果(保留列头,message 说明原因)。
+    pub fn ranked_empty(message: impl Into<String>) -> Self {
+        QueryResult {
+            columns: RANKED_COLUMNS.iter().map(|s| (*s).to_string()).collect(),
+            rows: Vec::new(),
+            message: message.into(),
+            affected: 0,
+        }
+    }
+}
+
+/// 一条带相关度分数的候选记忆。
+struct Ranked {
+    id: MemoryId,
+    score: f32,
 }
 
 impl Database {
@@ -75,6 +98,8 @@ impl Database {
             Statement::Select(sel) => self.exec_select(sel),
             Statement::Delete(del) => self.exec_delete(del.filter.as_ref()),
             Statement::Update(upd) => self.exec_update(&upd.assignments, upd.filter.as_ref()),
+            Statement::Search(s) => self.exec_search(s),
+            Statement::Related(r) => self.exec_related(r),
             Statement::Checkpoint => {
                 self.checkpoint()?;
                 Ok(QueryResult::message("checkpoint done"))
@@ -268,6 +293,127 @@ impl Database {
             .collect()
     }
 
+    // ------- SEARCH / RELATED(AI 检索)-------
+
+    /// SEARCH '自然语言查询' [LIMIT n]:BM25 相关性排序。
+    fn exec_search(&mut self, stmt: &SearchStmt) -> Result<QueryResult> {
+        let cfg = self.cfg.search.clone();
+        let query = self.query_vector(&stmt.query);
+        if query.is_empty() {
+            return Ok(QueryResult::ranked_empty(
+                "query has no indexable terms (all stopwords or too short?)",
+            ));
+        }
+        let ranked = self.rank(&query, &[], &[], &cfg);
+        let limit = stmt.limit.unwrap_or(cfg.default_limit);
+        self.materialize_ranked(ranked, limit)
+    }
+
+    /// RELATED TO <id> | RELATED '文本' [LIMIT n]:以种子做联想推荐。
+    fn exec_related(&mut self, stmt: &nebula_sql::ast::RelatedStmt) -> Result<QueryResult> {
+        let cfg = self.cfg.search.clone();
+        let (seed, exclude) = match &stmt.seed {
+            RelatedSeed::Id(id) => {
+                let Some(rec) = self.fetch_record(*id)? else {
+                    return Err(nebula_core::Error::Sql(format!(
+                        "RELATED TO: no memory with id {id}"
+                    )));
+                };
+                (keyword_pairs(&rec.keywords), vec![*id])
+            }
+            RelatedSeed::Text(text) => (self.query_vector(text), Vec::new()),
+        };
+        if seed.is_empty() {
+            return Ok(QueryResult::ranked_empty(
+                "seed has no indexable terms (all stopwords or too short?)",
+            ));
+        }
+        let ranked = self.rank(&seed, &seed, &exclude, &cfg);
+        let limit = stmt.limit.unwrap_or(cfg.default_limit);
+        self.materialize_ranked(ranked, limit)
+    }
+
+    /// 文本 → (词项, 权重) 查询向量(与建库时的关键词提取同一管线)。
+    fn query_vector(&self, text: &str) -> Vec<(String, f32)> {
+        self.extractor
+            .extract_keywords(text)
+            .into_iter()
+            .map(|k| (k.term, k.weight))
+            .collect()
+    }
+
+    /// 三层打分,返回按相关度降序的候选(过滤 `min_score`,截断由调用方负责)。
+    ///
+    /// 1. BM25:查询词 + 共现图扩展词构成查询向量;
+    /// 2. 种子相似度:`seed` 关键词向量与候选文档的余弦相似度;
+    /// 3. 联合重排:`score = bm25 + similarity_weight * cosine`。
+    fn rank(
+        &self,
+        query: &[(String, f32)],
+        seed: &[(String, f32)],
+        exclude: &[MemoryId],
+        cfg: &SearchConfig,
+    ) -> Vec<Ranked> {
+        // 第一层之一:共现图查询扩展(跳数/上限/衰减均来自配置)
+        let mut q_all: Vec<(String, f32)> = query.to_vec();
+        for (term, w) in self.index.expand(query, cfg) {
+            if !q_all.iter().any(|(t, _)| t == &term) {
+                q_all.push((term, w));
+            }
+        }
+        // 候选集:包含任一查询/扩展词的文档
+        let terms: Vec<&str> = q_all.iter().map(|(t, _)| t.as_str()).collect();
+        let candidates = self.index.docs_with_terms(terms.iter().copied());
+        let bm25 = self.index.bm25(&q_all, cfg);
+        // 第二、三层:种子余弦 + 联合重排
+        let mut out: Vec<Ranked> = Vec::with_capacity(candidates.len());
+        for id in candidates {
+            if exclude.contains(&id) {
+                continue;
+            }
+            let cos = if seed.is_empty() {
+                0.0
+            } else {
+                self.index.cosine(seed, id)
+            };
+            let score = bm25.get(&id).copied().unwrap_or(0.0) + cfg.similarity_weight * cos;
+            if score >= cfg.min_score {
+                out.push(Ranked { id, score });
+            }
+        }
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        out
+    }
+
+    /// 取前 `limit` 条候选,读记录并投影为结果集。
+    fn materialize_ranked(&mut self, ranked: Vec<Ranked>, limit: usize) -> Result<QueryResult> {
+        let ex_cfg = self.extractor.config().clone();
+        let mut rows = Vec::with_capacity(ranked.len().min(limit));
+        for r in ranked.into_iter().take(limit) {
+            if let Some(rec) = self.fetch_record(r.id)? {
+                rows.push(vec![
+                    rec.id.to_string(),
+                    format!("{:.4}", r.score),
+                    rec.content.clone(),
+                    fmt_keywords(&rec.keywords, ex_cfg.max_keywords),
+                    fmt_tags(&rec.tags),
+                    fmt_importance(rec.importance),
+                ]);
+            }
+        }
+        Ok(QueryResult {
+            columns: RANKED_COLUMNS.iter().map(|s| (*s).to_string()).collect(),
+            rows,
+            message: String::new(),
+            affected: 0,
+        })
+    }
+
     // ------- DELETE -------
 
     fn exec_delete(&mut self, filter: Option<&Expr>) -> Result<QueryResult> {
@@ -394,6 +540,11 @@ fn intersect_sorted(a: Vec<MemoryId>, b: Vec<MemoryId>) -> Vec<MemoryId> {
     out.sort_unstable();
     out.dedup();
     out
+}
+
+/// 关键词 → (词项, 权重)(检索用)。
+fn keyword_pairs(kws: &[Keyword]) -> Vec<(String, f32)> {
+    kws.iter().map(|k| (k.term.clone(), k.weight)).collect()
 }
 
 /// 在完整记录上评估表达式(扫描路径)。

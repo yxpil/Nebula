@@ -14,13 +14,20 @@ use crate::render::print_table;
 /// REPL 的帮助文本。
 const HELP: &str = "\
 可用命令:
-  <SQL>           执行一条 SQL(INSERT/SELECT/DELETE/UPDATE/CHECKPOINT/SHOW ...;可用分号分隔多条)
+  <SQL>           执行一条 SQL(INSERT/SELECT/DELETE/UPDATE/CHECKPOINT/SEARCH/RELATED ...;可用分号分隔多条)
   help            显示本帮助
   exit | quit     退出(本地模式会自动 CHECKPOINT)
 示例:
   INSERT INTO memories (content, tags) VALUES ('内容', 'tag1,tag2');
   SELECT id, content, keywords FROM memories WHERE keyword = 'rust';
-  SELECT * FROM memories WHERE content LIKE '%关键词%' ORDER BY id LIMIT 10;";
+  SELECT * FROM memories WHERE content LIKE '%关键词%' ORDER BY id LIMIT 10;
+  SEARCH 'rust 所有权' LIMIT 5;
+  RELATED TO 12 LIMIT 5;
+  RELATED '编译期检查 内存安全' LIMIT 5;
+说明:
+  SEARCH / RELATED 按 BM25 相关度 + 共现联想 + 关键词相似度重排,
+  返回列 id/score/content/keywords/tags/importance(score 为相关度分数)。
+  检索参数(k1/b/联想跳数/衰减/相似度权重等)见库旁配置 [engine.search] 段。";
 
 /// 本地模式:直接驱动 [`Database`]。
 pub fn run_local(mut db: Database, cfg: &LoadedConfig) -> Result<()> {

@@ -13,7 +13,7 @@
 //! 所有行为参数(检查点阈值、内容/关键词/关键点上限、分词与停用词)
 //! 通过 [`crate::EngineConfig`] 与停用词集合注入,本 crate 不读取配置文件。
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use nebula_core::{codec, MemoryId, MemoryRecord, Result};
@@ -58,14 +58,20 @@ impl Database {
         let path = path.as_ref().to_path_buf();
         let mut file = MemoryFile::open(&path, password)?;
         let snap = file.read_index_snapshot()?;
-        let index = MemoryIndex::load_snapshot(&snap)?;
-        Ok(Database {
+        let (index, stats_present) = MemoryIndex::load_snapshot(&snap)?;
+        let mut db = Database {
             path,
             file,
             index,
             extractor: TextExtractor::new(extractor_cfg.clone(), stopwords.clone()),
             cfg: cfg.clone(),
-        })
+        };
+        if !stats_present {
+            // 旧版(三段)快照没有检索统计:扫描全部记录重建,
+            // 保证 SEARCH / RELATED 对旧库立即可用(之后检查点会持久化)。
+            db.rebuild_term_stats()?;
+        }
+        Ok(db)
     }
 
     /// 创建新记忆库(文件必须不存在;使用引擎默认配置与内置停用词表)。
@@ -137,7 +143,8 @@ impl Database {
         record.updated_at = record.created_at;
         let bytes = codec::to_vec(&record);
         let loc = self.file.put_record(&bytes)?;
-        self.index.upsert(&record, loc);
+        let terms = term_counts(&self.extractor.tokenize(&record.content));
+        self.index.upsert(&record, &terms, loc);
         self.file.set_memory_count(self.index.len() as u64);
         self.file.commit_catalog()?;
 
@@ -162,7 +169,8 @@ impl Database {
         let old_loc = self.index.location(record.id).copied();
         let bytes = codec::to_vec(record);
         let loc = self.file.put_record(&bytes)?;
-        self.index.upsert(record, loc);
+        let terms = term_counts(&self.extractor.tokenize(&record.content));
+        self.index.upsert(record, &terms, loc);
         if let Some(old) = old_loc {
             if old != loc {
                 self.file.free_record(&old)?;
@@ -204,6 +212,26 @@ impl Database {
         self.checkpoint()
     }
 
+    /// 旧版快照升级:扫描全部记录,重建检索统计(词频/文档长度/共现图)。
+    ///
+    /// 一次性成本:每条记录读一次 + 分词;重建后由检查点持久化,不再需要。
+    fn rebuild_term_stats(&mut self) -> Result<()> {
+        let ids = self.index.all_ids();
+        let mut docs: Vec<(MemoryId, Vec<(String, u32)>, Vec<(String, f32)>)> =
+            Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(rec) = self.fetch_record(id)? {
+                let terms = term_counts(&self.extractor.tokenize(&rec.content));
+                let kws = rec.keywords.iter().map(|k| (k.term.clone(), k.weight)).collect();
+                docs.push((id, terms, kws));
+            }
+        }
+        for (id, terms, kws) in docs {
+            self.index.set_doc_stats(id, &terms, &kws);
+        }
+        Ok(())
+    }
+
     // ------- 便捷查询 API(不走 SQL,供内部/测试用) -------
 
     /// 按关键词直接检索(id, 权重, 记录)。
@@ -241,6 +269,18 @@ impl Drop for Database {
     }
 }
 
+/// 词频统计:tokens → [(词项, 次数)](按词项排序,结果可复现)。
+fn term_counts(tokens: &[String]) -> Vec<(String, u32)> {
+    let mut counts: BTreeMap<&str, u32> = BTreeMap::new();
+    for t in tokens {
+        *counts.entry(t.as_str()).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(t, c)| (t.to_string(), c))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +316,80 @@ mod tests {
         assert_eq!(db.location_of(id), Some(loc));
         assert!(db.fetch_record(999).unwrap().is_none());
         drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn search_and_related_via_sql() {
+        let path = tmp("search");
+        let mut db = Database::create(&path, PW, 4096).unwrap();
+        let id1 = db
+            .insert_memory(
+                "Rust 的所有权机制让内存安全无需 GC,所有权在编译期检查借用。".to_string(),
+                vec!["lang".into()],
+                "test".into(),
+                0.9,
+            )
+            .unwrap();
+        let id2 = db
+            .insert_memory(
+                "Rust 的借用检查器在编译期保证内存安全,这是所有权的核心规则。".to_string(),
+                vec![],
+                "test".into(),
+                0.5,
+            )
+            .unwrap();
+        let id3 = db
+            .insert_memory(
+                "今天下午去超市买菜,晚上做饭,顺便取了快递。".to_string(),
+                vec![],
+                "test".into(),
+                0.1,
+            )
+            .unwrap();
+
+        // SEARCH:两条 rust 记忆应排在生活记忆之前,结果带 score 列
+        let r = db.execute("SEARCH 'rust 内存安全' LIMIT 2").unwrap();
+        assert_eq!(
+            r.columns,
+            vec!["id", "score", "content", "keywords", "tags", "importance"]
+        );
+        assert_eq!(r.rows.len(), 2);
+        let top: std::collections::BTreeSet<u64> = r
+            .rows
+            .iter()
+            .map(|row| row[0].parse::<u64>().unwrap())
+            .collect();
+        let expected: std::collections::BTreeSet<u64> =
+            [id1, id2].into_iter().collect();
+        assert_eq!(top, expected);
+        assert!(!top.contains(&id3));
+        // 分数降序且为正
+        let s0: f32 = r.rows[0][1].parse().unwrap();
+        let s1: f32 = r.rows[1][1].parse().unwrap();
+        assert!(s0 >= s1 && s1 > 0.0);
+
+        // RELATED TO:以 id1 为种子,联想到 id2(rust/内存共现),不含自身
+        let r = db.execute(&format!("RELATED TO {id1} LIMIT 1")).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], id2.to_string());
+
+        // RELATED '文本':自由文本作种子
+        let r = db.execute("RELATED '所有权 编译期'").unwrap();
+        assert!(!r.rows.is_empty());
+        assert_eq!(r.rows[0][0], id1.to_string());
+
+        // 错误种子 / 无可索引词
+        assert!(db.execute("RELATED TO 999").is_err());
+        let r = db.execute("SEARCH '的 了 和'").unwrap();
+        assert!(r.rows.is_empty(), "全停用词查询应无结果");
+        assert_eq!(r.message, "query has no indexable terms (all stopwords or too short?)");
+
+        drop(db);
+        // 重开:检索统计随快照恢复,SEARCH 仍然可用
+        let mut db2 = Database::open(&path, PW).unwrap();
+        let r = db2.execute("SEARCH 'rust' LIMIT 5").unwrap();
+        assert_eq!(r.rows.len(), 2);
         let _ = std::fs::remove_file(&path);
     }
 }

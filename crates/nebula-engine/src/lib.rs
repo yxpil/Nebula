@@ -5,7 +5,8 @@ pub mod database;
 pub mod executor;
 pub mod format;
 pub mod index;
+pub mod search;
 
-pub use config::EngineConfig;
+pub use config::{EngineConfig, SearchConfig};
 pub use database::Database;
 pub use executor::QueryResult;
