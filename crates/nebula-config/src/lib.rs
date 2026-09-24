@@ -132,6 +132,31 @@ impl Default for AuthConfig {
     }
 }
 
+/// `[logging]` 运行诊断日志段。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct LoggingConfig {
+    /// 是否写日志文件(false 时所有日志调用静默)。
+    pub enabled: bool,
+    /// 日志文件名(相对本配置目录,必须是目录内的普通文件名)。
+    pub file: String,
+    /// 日志级别:error / warn / info / debug。
+    pub level: String,
+    /// 单文件大小上限(字节);超过后滚动为 `.log.1` 并新建。
+    pub max_size: u64,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        LoggingConfig {
+            enabled: true,
+            file: "nebula.log".to_string(),
+            level: "info".to_string(),
+            max_size: 10 * 1024 * 1024,
+        }
+    }
+}
+
 /// 完整配置:一个库旁目录的全部可调参数。
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -142,6 +167,7 @@ pub struct NebulaConfig {
     pub server: ServerConfig,
     pub cli: CliConfig,
     pub auth: AuthConfig,
+    pub logging: LoggingConfig,
 }
 
 impl NebulaConfig {
@@ -312,6 +338,30 @@ impl LoadedConfig {
                 "auth.password_min_len must be >= 1".into(),
             ));
         }
+        let lg = &c.logging;
+        if nebula_core::LogLevel::parse(&lg.level).is_none() {
+            return Err(Error::Config(format!(
+                "logging.level must be one of error/warn/info/debug, got '{}'",
+                lg.level
+            )));
+        }
+        if lg.file.is_empty() {
+            return Err(Error::Config("logging.file must not be empty".into()));
+        }
+        if lg.max_size < 1024 {
+            return Err(Error::Config(
+                "logging.max_size must be >= 1024 bytes".into(),
+            ));
+        }
+        let mut log_comps = Path::new(&lg.file).components();
+        let log_name_ok =
+            matches!(log_comps.next(), Some(Component::Normal(_))) && log_comps.next().is_none();
+        if !log_name_ok {
+            return Err(Error::Config(format!(
+                "logging.file must be a plain file name inside the config dir, got '{}'",
+                lg.file
+            )));
+        }
         c.server
             .default_addr
             .parse::<SocketAddr>()
@@ -412,6 +462,16 @@ prompt = \"nebula> \"
 [auth]
 # 新建密码的最小长度
 password_min_len = 8
+
+[logging]
+# 运行诊断日志:false 关闭(所有日志调用静默)
+enabled = true
+# 日志文件名(位于本配置目录内)
+file = \"nebula.log\"
+# 记录级别:error(仅错误) / warn(含告警) / info(默认) / debug(最详细)
+level = \"info\"
+# 单文件大小上限(字节,默认 10 MiB);超过后旧日志滚动为 nebula.log.1
+max_size = 10485760
 ";
 
 /// 默认停用词表模板文本(一行一词,# 注释;词条排序保证输出稳定可复现)。

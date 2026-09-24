@@ -23,16 +23,25 @@ struct StopwordFile {
 }
 
 /// 内置默认停用词集合(解析嵌入的 JSON;仅用于模板生成与测试)。
+///
+/// JSON 是编译期嵌入数据,正常不会损坏;但即使损坏也只降级为空集合
+/// (停用词不过滤),绝不在运行时 panic。
 pub fn default_stopword_set() -> HashSet<String> {
     static CACHE: OnceLock<HashSet<String>> = OnceLock::new();
     CACHE.get_or_init(|| {
-        let parsed: StopwordFile = serde_json::from_str(DEFAULT_STOPWORDS_JSON)
-            .expect("embedded stopwords.json must be valid");
-        assert!(
-            !parsed.stopwords.is_empty(),
-            "embedded stopwords.json must not be empty"
-        );
-        parsed.stopwords.into_iter().collect()
+        match serde_json::from_str::<StopwordFile>(DEFAULT_STOPWORDS_JSON) {
+            Ok(parsed) if !parsed.stopwords.is_empty() => {
+                parsed.stopwords.into_iter().collect()
+            }
+            Ok(_) => {
+                eprintln!("warning: embedded stopwords.json is empty; stopword filtering disabled");
+                HashSet::new()
+            }
+            Err(e) => {
+                eprintln!("warning: embedded stopwords.json is invalid ({e}); stopword filtering disabled");
+                HashSet::new()
+            }
+        }
     })
     .clone()
 }

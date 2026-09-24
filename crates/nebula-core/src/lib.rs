@@ -7,9 +7,43 @@
 
 pub mod codec;
 pub mod error;
+pub mod logger;
 pub mod types;
 
 pub use error::{Error, Result};
+pub use logger::{init as init_logger, LogLevel};
 pub use types::{
     Keyword, MemoryId, MemoryRecord, RecordLocation, Timestamp, DEFAULT_DB, FORMAT_VERSION,
 };
+
+/// 记录 ERROR 级别日志(用法同 `format!`)。
+#[macro_export]
+macro_rules! log_error {
+    ($($arg:tt)*) => {
+        $crate::logger::log($crate::logger::LogLevel::Error, module_path!(), &format!($($arg)*))
+    };
+}
+
+/// 记录 WARN 级别日志。
+#[macro_export]
+macro_rules! log_warn {
+    ($($arg:tt)*) => {
+        $crate::logger::log($crate::logger::LogLevel::Warn, module_path!(), &format!($($arg)*))
+    };
+}
+
+/// 记录 INFO 级别日志。
+#[macro_export]
+macro_rules! log_info {
+    ($($arg:tt)*) => {
+        $crate::logger::log($crate::logger::LogLevel::Info, module_path!(), &format!($($arg)*))
+    };
+}
+
+/// 记录 DEBUG 级别日志。
+#[macro_export]
+macro_rules! log_debug {
+    ($($arg:tt)*) => {
+        $crate::logger::log($crate::logger::LogLevel::Debug, module_path!(), &format!($($arg)*))
+    };
+}

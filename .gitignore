@@ -2,3 +2,5 @@
 *.ndb
 *.swp
 .DS_Store
+/nebula.conf.d
+/.smoke
