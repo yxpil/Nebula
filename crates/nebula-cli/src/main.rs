@@ -23,10 +23,11 @@ use nebula_config::{
     config_dir_for_db, LoadedConfig, NebulaConfig, CONFIG_FILE,
 };
 use nebula_core::{Error, Result};
+use nebula_cluster::Cluster;
 use nebula_engine::Database;
 use nebula_server::{Client, Server};
 
-/// connect 模式在未指定 --config 时使用的默认配置目录(相对于当前工作目录)。
+/// connect/open --dir 模式在未指定 --config 时使用的默认配置目录(相对于当前工作目录)。
 const CONNECT_CONFIG_DIR: &str = "nebula.conf.d";
 
 fn main() -> ExitCode {
@@ -65,10 +66,14 @@ fn print_help() {
   nebula create  --db <path> [--addr host:port]   创建新库(带 --addr 则直接起服务端)
   nebula open    --db <path>                      打开本地库并进入交互界面
   nebula serve   --db <path> [--addr host:port]   启动 TCP 服务端
+  nebula create  --dir <directory>                初始化目录集群(多库/多用户)
+  nebula open    --dir <directory>                打开目录集群并进入交互界面
+  nebula serve   --dir <directory>                以目录集群方式启动 TCP 服务端
   nebula connect --addr <host:port>               连接远程服务端
 
 选项:
-  --config <dir>    指定配置目录(默认 <库文件>.conf.d;connect 默认为 ./{CONNECT_CONFIG_DIR})
+  --config <dir>    指定配置目录(默认 <库文件>.conf.d;connect/--dir 默认为 ./{CONNECT_CONFIG_DIR})
+  --user <name>     登录用户(仅 --dir/connect;默认 admin,也可用 NEBULA_USER)
   --page-size <n>   建库页大小(覆盖配置,4096..65536,须为 2 的幂)
   -h, --help        显示本帮助
 
@@ -80,7 +85,8 @@ fn print_help() {
   也可在会话内用 SET CACHE query|doc <n> 在线调整(SHOW CACHE 查看命中统计)。
 
 其他:
-  NEBULA_PASSWORD   环境变量提供密码(跳过终端输入,便于脚本)",
+  NEBULA_PASSWORD   环境变量提供密码(跳过终端输入,便于脚本)
+  NEBULA_USER       环境变量提供用户名(等价 --user)",
         version = env!("CARGO_PKG_VERSION")
     );
 }
@@ -118,6 +124,36 @@ fn load_or_create_config(dir: &Path) -> Result<LoadedConfig> {
 
 fn cmd_create(args: &[String]) -> Result<()> {
     let opts = Opts::parse(args)?;
+    let cfg = load_or_create_config(&resolve_config_dir(&opts, opts.db.as_deref()))?;
+    if let Some(dir) = &opts.dir {
+        // 目录集群:初始化(main.ndb + _admin.ndb,admin 密码即集群密码)
+        if opts.db.is_some() {
+            return Err(Error::Sql("--db and --dir are mutually exclusive".into()));
+        }
+        let password = prompt_new_password(cfg.config.auth.password_min_len)?;
+        if let Some(addr) = &opts.addr {
+            let server = Server::open_directory_configured(
+                parse_addr(addr)?,
+                dir,
+                &password,
+                &cfg.config.engine,
+                &cfg.config.tokenizer.extract,
+                &cfg.stopwords,
+            )?;
+            println!("created cluster {}", dir.display());
+            return server.run();
+        }
+        let cluster = Cluster::configured(
+            dir,
+            &password,
+            &cfg.config.engine,
+            &cfg.config.tokenizer.extract,
+            &cfg.stopwords,
+        )?;
+        println!("created cluster {}", dir.display());
+        return repl::run_local(repl::LocalBackend::Cluster(cluster), &opts.user_name()?, &cfg);
+    }
+
     let path = opts.db_path("create")?;
     if path.exists() {
         return Err(Error::Storage(format!(
@@ -125,7 +161,6 @@ fn cmd_create(args: &[String]) -> Result<()> {
             path.display()
         )));
     }
-    let cfg = load_or_create_config(&resolve_config_dir(&opts, Some(&path)))?;
     let password = prompt_new_password(cfg.config.auth.password_min_len)?;
     // 命令行 --page-size 覆盖配置;配置值在建库时固化进库文件头
     let page_size = opts
@@ -154,14 +189,31 @@ fn cmd_create(args: &[String]) -> Result<()> {
         &cfg.stopwords,
     )?;
     println!("created database {} (page size {page_size})", path.display());
-    repl::run_local(db, &cfg)
+    repl::run_local(repl::LocalBackend::Single(db), "admin", &cfg)
 }
 
 fn cmd_open(args: &[String]) -> Result<()> {
     let opts = Opts::parse(args)?;
-    let path = opts.db_path("open")?;
-    let cfg = load_or_create_config(&resolve_config_dir(&opts, Some(&path)))?;
+    let cfg = load_or_create_config(&resolve_config_dir(&opts, opts.db.as_deref()))?;
     let password = prompt_password()?;
+    if let Some(dir) = &opts.dir {
+        if opts.db.is_some() {
+            return Err(Error::Sql("--db and --dir are mutually exclusive".into()));
+        }
+        let cluster = Cluster::configured(
+            dir,
+            &password,
+            &cfg.config.engine,
+            &cfg.config.tokenizer.extract,
+            &cfg.stopwords,
+        )?;
+        return repl::run_local(
+            repl::LocalBackend::Cluster(cluster),
+            &opts.user_name()?,
+            &cfg,
+        );
+    }
+    let path = opts.db_path("open")?;
     let db = Database::open_configured(
         &path,
         &password,
@@ -169,18 +221,33 @@ fn cmd_open(args: &[String]) -> Result<()> {
         &cfg.config.tokenizer.extract,
         &cfg.stopwords,
     )?;
-    repl::run_local(db, &cfg)
+    repl::run_local(repl::LocalBackend::Single(db), "admin", &cfg)
 }
 
 fn cmd_serve(args: &[String]) -> Result<()> {
     let opts = Opts::parse(args)?;
-    let path = opts.db_path("serve")?;
-    let cfg = load_or_create_config(&resolve_config_dir(&opts, Some(&path)))?;
+    let cfg = load_or_create_config(&resolve_config_dir(&opts, opts.db.as_deref()))?;
     let password = prompt_password()?;
     let addr = opts
         .addr
         .clone()
         .unwrap_or_else(|| cfg.config.server.default_addr.clone());
+    if let Some(dir) = &opts.dir {
+        if opts.db.is_some() {
+            return Err(Error::Sql("--db and --dir are mutually exclusive".into()));
+        }
+        let server = Server::open_directory_configured(
+            parse_addr(&addr)?,
+            dir,
+            &password,
+            &cfg.config.engine,
+            &cfg.config.tokenizer.extract,
+            &cfg.stopwords,
+        )?;
+        println!("opened cluster {} (listening on {addr})", dir.display());
+        return server.run();
+    }
+    let path = opts.db_path("serve")?;
     let server = Server::open_configured(
         parse_addr(&addr)?,
         &path,
@@ -195,6 +262,9 @@ fn cmd_serve(args: &[String]) -> Result<()> {
 
 fn cmd_connect(args: &[String]) -> Result<()> {
     let opts = Opts::parse(args)?;
+    if opts.dir.is_some() {
+        return Err(Error::Sql("connect uses --addr, not --dir".into()));
+    }
     let cfg = load_or_create_config(&resolve_config_dir(&opts, None))?;
     let addr = opts
         .addr
@@ -202,8 +272,9 @@ fn cmd_connect(args: &[String]) -> Result<()> {
         .unwrap_or_else(|| cfg.config.server.default_addr.clone());
     // 先解析校验地址格式,避免密码白输
     parse_addr(&addr)?;
+    let user = opts.user_name()?;
     let password = prompt_password()?;
-    let client = Client::connect(&addr, &password)?;
+    let client = Client::connect_as(&addr, &user, &password)?;
     repl::run_remote(client, &cfg)
 }
 
@@ -212,18 +283,22 @@ fn cmd_connect(args: &[String]) -> Result<()> {
 /// 解析后的命令行选项。
 struct Opts {
     db: Option<PathBuf>,
+    dir: Option<PathBuf>,
     addr: Option<String>,
     page_size: Option<u32>,
     config: Option<PathBuf>,
+    user: Option<String>,
 }
 
 impl Opts {
     fn parse(args: &[String]) -> Result<Self> {
         let mut opts = Opts {
             db: None,
+            dir: None,
             addr: None,
             page_size: None,
             config: None,
+            user: None,
         };
         let mut i = 0;
         while i < args.len() {
@@ -231,8 +306,10 @@ impl Opts {
             let value = args.get(i + 1).map(String::as_str);
             match key {
                 "--db" | "-d" => opts.db = Some(PathBuf::from(take_value(key, value)?)),
+                "--dir" => opts.dir = Some(PathBuf::from(take_value(key, value)?)),
                 "--addr" | "-a" => opts.addr = Some(take_value(key, value)?.to_string()),
                 "--config" | "-c" => opts.config = Some(PathBuf::from(take_value(key, value)?)),
+                "--user" | "-u" => opts.user = Some(take_value(key, value)?.to_string()),
                 "--page-size" => {
                     let v = take_value(key, value)?;
                     opts.page_size = Some(v.parse::<u32>().map_err(|_| {
@@ -251,9 +328,22 @@ impl Opts {
     }
 
     fn db_path(&self, cmd: &str) -> Result<PathBuf> {
-        self.db
-            .clone()
-            .ok_or_else(|| Error::Sql(format!("`{cmd}` requires --db <path>")))
+        self.db.clone().ok_or_else(|| {
+            Error::Sql(format!("`{cmd}` requires --db <path> (or --dir <directory>)"))
+        })
+    }
+
+    /// 登录用户:--user → NEBULA_USER → admin。
+    fn user_name(&self) -> Result<String> {
+        if let Some(u) = &self.user {
+            return Ok(u.clone());
+        }
+        if let Ok(u) = std::env::var("NEBULA_USER") {
+            if !u.is_empty() {
+                return Ok(u);
+            }
+        }
+        Ok("admin".into())
     }
 }
 

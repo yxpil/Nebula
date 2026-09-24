@@ -5,11 +5,20 @@
 use std::io::{BufRead, Write};
 
 use nebula_config::LoadedConfig;
-use nebula_core::Result;
-use nebula_engine::Database;
+use nebula_core::{DEFAULT_DB, Result};
+use nebula_engine::{Database, Session, SessionBackend};
+use nebula_cluster::Cluster;
 use nebula_server::{Client, Response};
 
 use crate::render::print_table;
+
+/// 本地 REPL 后端:单文件或目录集群。
+pub enum LocalBackend {
+    /// 单个 .ndb 文件(只有内置 admin)。
+    Single(Database),
+    /// 目录集群(多文件、多用户)。
+    Cluster(Cluster),
+}
 
 /// REPL 的帮助文本。
 const HELP: &str = "\
@@ -25,6 +34,11 @@ const HELP: &str = "\
   RELATED TO 12 LIMIT 5;
   RELATED '编译期检查 内存安全' LIMIT 5;
   SHOW CACHE; CLEAR CACHE; SHOW HOT LIMIT 5; SET CACHE doc 256;
+多库(目录集群 --dir 模式):
+  CREATE DATABASE kb; USE kb; ATTACH FILE 'notes.ndb' AS notes; DETACH notes;
+  SEARCH 'rust' IN main, kb; RELATED TO kb.12;
+  CREATE USER bob IDENTIFIED BY '...'; GRANT READ, WRITE ON kb TO bob;
+  REVOKE WRITE ON kb FROM bob; SHOW GRANTS FOR bob; DROP USER bob;
 说明:
   SEARCH / RELATED 按 BM25 相关度 + 共现联想 + 关键词相似度重排,
   返回列 id/score/content/keywords/tags/importance(score 为相关度分数)。
@@ -35,13 +49,26 @@ const HELP: &str = "\
   SHOW HOT 查看热点记忆,SET CACHE query|doc <n> 在线调整容量;
   缓存容量与热点预加载条数见库旁配置 [engine.cache] 段。";
 
-/// 本地模式:直接驱动 [`Database`]。
-pub fn run_local(mut db: Database, cfg: &LoadedConfig) -> Result<()> {
-    println!(
-        "connected to {} ({} memories). 输入 help 查看用法, exit 退出。",
-        db.path().display(),
-        db.memory_count()
-    );
+/// 本地模式:驱动单文件或目录集群;会话(当前用户/工作库)全程保持。
+pub fn run_local(mut backend: LocalBackend, user: &str, cfg: &LoadedConfig) -> Result<()> {
+    // 整个 REPL 只持有一个 Session:USE 切换、用户身份跨语句生效。
+    let mut session = match &backend {
+        LocalBackend::Single(db) => {
+            println!(
+                "connected to {} ({} memories). 输入 help 查看用法, exit 退出。",
+                db.path().display(),
+                db.memory_count()
+            );
+            Session::admin()
+        }
+        LocalBackend::Cluster(cluster) => {
+            println!(
+                "connected to cluster {} as user '{user}' (database '{DEFAULT_DB}'). 输入 help 查看用法, exit 退出。",
+                cluster.dir_display().display()
+            );
+            Session::new(user, DEFAULT_DB)
+        }
+    };
     let prompt = cfg.config.cli.prompt.clone();
     let (cell_max, max_rows) = (cfg.config.cli.cell_max, cfg.config.cli.max_rows);
     let stdin = std::io::stdin();
@@ -64,8 +91,13 @@ pub fn run_local(mut db: Database, cfg: &LoadedConfig) -> Result<()> {
             }
             _ => {}
         }
-        // 单行可含多条以分号分隔的语句,逐条执行并打印结果。
-        match db.execute_script(sql) {
+        // 单行可含多条以分号分隔的语句,逐条执行并打印结果;
+        // 会话按可变引用传入,USE 等语句会更新它。
+        let outcome = match &mut backend {
+            LocalBackend::Single(db) => run_script_line(db, &mut session, sql),
+            LocalBackend::Cluster(cluster) => run_script_line(cluster, &mut session, sql),
+        };
+        match outcome {
             Ok(results) => {
                 for r in &results {
                     print_result(&r.columns, &r.rows, &r.message, r.affected, cell_max, max_rows);
@@ -74,10 +106,27 @@ pub fn run_local(mut db: Database, cfg: &LoadedConfig) -> Result<()> {
             Err(e) => eprintln!("error: {e}"),
         }
     }
-    // 退出前落盘,保证索引快照与目录持久化。
-    db.close()?;
+    // 退出前落盘:单文件或集群(含用户/授权)全部持久化。
+    match &mut backend {
+        LocalBackend::Single(db) => db.close()?,
+        LocalBackend::Cluster(cluster) => cluster.close()?,
+    }
     println!("bye.");
     Ok(())
+}
+
+/// 在会话后端上执行一段(可能多条)SQL,返回每条语句的结果。
+fn run_script_line(
+    host: &mut dyn SessionBackend,
+    session: &mut Session,
+    sql: &str,
+) -> Result<Vec<nebula_engine::QueryResult>> {
+    let stmts = nebula_sql::parse_script(sql)?;
+    let mut results = Vec::with_capacity(stmts.len());
+    for stmt in stmts {
+        results.push(nebula_engine::executor::dispatch(host, session, &stmt)?);
+    }
+    Ok(results)
 }
 
 /// 远程模式:通过 [`Client`] 走加密 TCP 会话。
