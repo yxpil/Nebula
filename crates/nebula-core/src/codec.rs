@@ -82,6 +82,11 @@ impl Writer {
         self.buf.extend_from_slice(b);
     }
 
+    /// 原样追加字节(不带长度前缀;用于快照魔数等定长标记)。
+    pub fn raw(&mut self, b: &[u8]) {
+        self.buf.extend_from_slice(b);
+    }
+
     pub fn str(&mut self, s: &str) {
         self.bytes(s.as_bytes());
     }

@@ -43,10 +43,18 @@ impl BinaryDecode for Keyword {
     }
 }
 
+/// 默认逻辑库名(单文件旧库升级后全部记录归入该库)。
+pub const DEFAULT_DB: &str = "main";
+
+/// 记录编码版本:1 = 无库名字段;2 = id 之后追加 `db`(所属逻辑库)。
+pub const RECORD_VERSION: u32 = 2;
+
 /// 一条完整记忆记录(数据页中实际落盘的内容)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryRecord {
     pub id: MemoryId,
+    /// 所属逻辑库(单文件多库;旧版记录解码为 "main")。
+    pub db: String,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
     /// 重要度 0.0 ~ 1.0,影响检索排序。
@@ -68,6 +76,7 @@ impl MemoryRecord {
         let now = now_millis();
         MemoryRecord {
             id: 0,
+            db: DEFAULT_DB.to_string(),
             created_at: now,
             updated_at: now,
             importance: 0.5,
@@ -77,6 +86,12 @@ impl MemoryRecord {
             key_points: Vec::new(),
             keywords: Vec::new(),
         }
+    }
+
+    /// 指定所属逻辑库。
+    pub fn with_db(mut self, db: impl Into<String>) -> Self {
+        self.db = db.into();
+        self
     }
 
     pub fn with_tags(mut self, tags: Vec<String>) -> Self {
@@ -97,9 +112,10 @@ impl MemoryRecord {
 
 impl BinaryEncode for MemoryRecord {
     fn encode(&self, w: &mut Writer) {
-        // 记录版本号,便于未来格式演进。
-        w.u32(1);
+        // 记录版本号,便于未来格式演进;v2 起在 id 之后追加所属逻辑库 db。
+        w.u32(RECORD_VERSION);
         self.id.encode(w);
+        self.db.encode(w);
         self.created_at.encode(w);
         self.updated_at.encode(w);
         self.importance.encode(w);
@@ -114,13 +130,20 @@ impl BinaryEncode for MemoryRecord {
 impl BinaryDecode for MemoryRecord {
     fn decode(r: &mut Reader<'_>) -> Result<Self> {
         let version = r.u32()?;
-        if version != 1 {
-            return Err(crate::error::Error::Codec(format!(
-                "unsupported memory record version {version}"
-            )));
-        }
+        let id = r.u64()?;
+        let db = match version {
+            // v1 无库名字段:旧库记录全部归入默认库
+            1 => DEFAULT_DB.to_string(),
+            2 => String::decode(r)?,
+            other => {
+                return Err(crate::error::Error::Codec(format!(
+                    "unsupported memory record version {other}"
+                )))
+            }
+        };
         Ok(MemoryRecord {
-            id: r.u64()?,
+            id,
+            db,
             created_at: r.i64()?,
             updated_at: r.i64()?,
             importance: r.f32()?,
@@ -204,5 +227,34 @@ mod tests {
         let k = Keyword::new("数据库", 0.75);
         let back: Keyword = from_slice(&to_vec(&k)).unwrap();
         assert_eq!(k, back);
+    }
+
+    #[test]
+    fn v1_record_without_db_decodes_as_main() {
+        // 手工编码 v1 记录(version=1,无 db 字段),旧库无缝升级
+        let mut w = Writer::new();
+        w.u32(1); // version
+        7u64.encode(&mut w); // id
+        1_700_000_000_000i64.encode(&mut w); // created_at
+        1_700_000_000_000i64.encode(&mut w); // updated_at
+        0.5f32.encode(&mut w); // importance
+        "旧版记忆".to_string().encode(&mut w); // content
+        "cli".to_string().encode(&mut w); // source
+        Vec::<String>::new().encode(&mut w); // tags
+        vec!["关键点".to_string()].encode(&mut w); // key_points
+        Vec::<Keyword>::new().encode(&mut w); // keywords
+        let back: MemoryRecord = from_slice(&w.into_vec()).unwrap();
+        assert_eq!(back.id, 7);
+        assert_eq!(back.db, DEFAULT_DB, "v1 记录必须归入默认库");
+        assert_eq!(back.content, "旧版记忆");
+    }
+
+    #[test]
+    fn v2_record_carries_db() {
+        let rec = MemoryRecord::new("新库记忆").with_db("work");
+        let bytes = to_vec(&rec);
+        let back: MemoryRecord = from_slice(&bytes).unwrap();
+        assert_eq!(back.db, "work");
+        assert_eq!(rec, back);
     }
 }

@@ -106,11 +106,11 @@ fn auto_extract_keywords_and_points() {
     // 关键点按句抽取
     assert!(r.rows[0][2].contains("借用检查器"), "{}", r.rows[0][2]);
     // search_by_keyword 便捷 API
-    let hits = db.search_by_keyword("rust", 10).unwrap();
+    let hits = db.search_by_keyword("main", "rust", 10).unwrap();
     assert_eq!(hits.len(), 1);
     assert!(hits[0].1 > 0.0);
     // 索引内词项可枚举
-    assert!(db.all_terms().iter().any(|(t, _)| t == "rust"));
+    assert!(db.all_terms("main").iter().any(|(t, _)| t == "rust"));
     drop(db);
     let _ = std::fs::remove_file(&path);
 }
@@ -136,7 +136,7 @@ fn reopen_preserves_state() {
     let r = db
         .execute("INSERT INTO memories (content) VALUES ('重启之后的第四条记忆')")
         .unwrap();
-    assert!(r.message.contains("id=4"), "{}", r.message);
+    assert!(r.message.contains("main.4"), "{}", r.message);
     db.close().unwrap();
 
     // 密码错误必须拒绝
