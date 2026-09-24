@@ -1,9 +1,11 @@
 name: Release
 
 # push tag (形如 v0.1.0-ES) 触发:四目标构建 → 打包 → 创建 GitHub Release。
+# 也支持 workflow_dispatch,便于对已有 tag 手动重跑。
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -14,8 +16,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-    matrix:
-      include:
+      matrix:
+        include:
         - os: windows-latest
           target: x86_64-pc-windows-msvc
           bin: nebula.exe
@@ -24,7 +26,7 @@ jobs:
           target: x86_64-unknown-linux-gnu
           bin: nebula
           ext: tar.gz
-        - os: macos-13
+        - os: macos-15-intel
           target: x86_64-apple-darwin
           bin: nebula
           ext: tar.gz
@@ -72,8 +74,9 @@ jobs:
           New-Item -ItemType Directory -Force "installer/stage" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" "installer/stage/"
           Copy-Item README.md, LICENSE, assets/icon.png "installer/stage/"
-          & "C:\Program Files (x86)\NSIS\makensis.exe" /V2 "/DVERSION=$tag" installer/nebula.nsi
-          $setup = Get-Item "dist/nebula-setup-$tag.exe"
+          $ver = $env:GITHUB_REF_NAME -replace '^v', ''
+          & "C:\Program Files (x86)\NSIS\makensis.exe" /V2 "/DVERSION=$ver" installer/nebula.nsi
+          $setup = Get-Item "dist/nebula-setup-$ver.exe"
           if (-not $setup) { throw "NSIS setup was not produced" }
           $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
           "$hash  $($setup.Name)" | Set-Content "$($setup.FullName).sha256" -NoNewline
@@ -139,6 +142,7 @@ jobs:
 
             > ES 为工程测试版,数据格式与接口可能继续演进。
           files: |
+            dist/*.exe
             dist/*.zip
             dist/*.tar.gz
             dist/*.sha256
