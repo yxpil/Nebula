@@ -11,17 +11,58 @@
 
 pub use nebula_sql::ast::Privilege;
 
-use nebula_core::{DEFAULT_DB, Result};
+use nebula_core::{DEFAULT_DB, MemoryId, MemoryRecord, Result};
 use nebula_sql::ast::GrantObject;
 
 /// 内置管理员用户名(单文件模式唯一账号)。
 pub const DEFAULT_USER: &str = "admin";
 
-/// 一个连接/REPL 会话:当前用户与当前工作库。
+/// 单条写操作的撤销动作(undo log)。
+#[derive(Debug, Clone)]
+pub enum UndoAction {
+    /// 插入了 (db, id):撤销即删除。
+    Inserted { db: String, id: MemoryId },
+    /// 从 db 删除了这些完整记录:撤销即原样写回。
+    Deleted {
+        db: String,
+        records: Vec<MemoryRecord>,
+    },
+    /// db 中一条记录被替换;撤销即恢复旧记录。
+    Replaced {
+        db: String,
+        old: MemoryRecord,
+    },
+}
+
+/// 一个活动事务:按执行顺序积累的 undo 动作。
+#[derive(Debug, Clone, Default)]
+pub struct Transaction {
+    undos: Vec<UndoAction>,
+}
+
+impl Transaction {
+    /// 追加一条 undo。
+    pub fn record(&mut self, action: UndoAction) {
+        self.undos.push(action);
+    }
+
+    /// 是否没有任何写操作(只读事务)。
+    pub fn is_empty(&self) -> bool {
+        self.undos.is_empty()
+    }
+
+    /// 取出全部 undo(反向遍历应用即回滚)。
+    pub fn into_undos(self) -> Vec<UndoAction> {
+        self.undos
+    }
+}
+
+/// 一个连接/REPL 会话:当前用户、当前工作库与可选的活动事务。
 #[derive(Debug, Clone)]
 pub struct Session {
     user: String,
     current_db: String,
+    txn: Option<Transaction>,
 }
 
 impl Session {
@@ -29,6 +70,7 @@ impl Session {
         Session {
             user: user.into(),
             current_db: current_db.into(),
+            txn: None,
         }
     }
 
@@ -37,6 +79,7 @@ impl Session {
         Session {
             user: DEFAULT_USER.into(),
             current_db: DEFAULT_DB.into(),
+            txn: None,
         }
     }
 
@@ -51,6 +94,42 @@ impl Session {
     /// 切换工作库(USE 成功后调用)。
     pub fn set_current_db(&mut self, db: impl Into<String>) {
         self.current_db = db.into();
+    }
+
+    // ------- 事务状态 -------
+
+    /// 是否有活动事务。
+    pub fn in_transaction(&self) -> bool {
+        self.txn.is_some()
+    }
+
+    /// 开启事务;已有活动事务时报错(不支持嵌套)。
+    pub fn begin_txn(&mut self) -> Result<()> {
+        if self.txn.is_some() {
+            return Err(nebula_core::Error::Sql(
+                "a transaction is already active (nested transactions are not supported)".into(),
+            ));
+        }
+        self.txn = Some(Transaction::default());
+        Ok(())
+    }
+
+    /// 记录一条 undo(必须在活动事务中调用)。
+    pub fn record_undo(&mut self, action: UndoAction) -> Result<()> {
+        match self.txn.as_mut() {
+            Some(txn) => {
+                txn.record(action);
+                Ok(())
+            }
+            None => Err(nebula_core::Error::Engine(
+                "internal: record_undo without an active transaction".into(),
+            )),
+        }
+    }
+
+    /// 取出并清除活动事务(COMMIT / ROLLACK 都用它)。
+    pub fn take_txn(&mut self) -> Option<Transaction> {
+        self.txn.take()
     }
 }
 

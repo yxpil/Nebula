@@ -858,7 +858,13 @@ impl MemBackend for Cluster {
                 match &per_file_seed {
                     RelatedSeed::Text(t) => RelatedSeed::Text(t.clone()),
                     RelatedSeed::QualifiedId(real, id) => {
-                        let rec = self.fetch_mem_via(owner_file.unwrap(), real, *id)?;
+                        // owner_file 理应 Some;缺失时返回错误而非解引用崩溃。
+                        let Some(owner_idx) = owner_file else {
+                            return Err(nebula_core::Error::Engine(
+                                "RELATED across files: seed file is unknown".into(),
+                            ));
+                        };
+                        let rec = self.fetch_mem_via(owner_idx, real, *id)?;
                         let Some(rec) = rec else {
                             return Err(nebula_core::Error::Sql(format!(
                                 "RELATED TO: no memory {real}.{id}"
@@ -948,6 +954,17 @@ impl MemBackend for Cluster {
             }
         }
         self.save_admin()
+    }
+
+    fn set_persistence_deferred(&mut self, deferred: bool) {
+        // 集群事务:对所有已打开的文件槽统一设置。
+        // 事务期间不会有 CREATE DATABASE / ATTACH(DDL 会隐式提交),
+        // 因此不会遗漏新建槽位。
+        for slot in &mut self.slots {
+            if let Some(db) = slot.db.as_mut() {
+                db.set_persistence_deferred(deferred);
+            }
+        }
     }
 }
 

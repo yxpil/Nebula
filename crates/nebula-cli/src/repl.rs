@@ -39,6 +39,12 @@ const HELP: &str = "\
   SEARCH 'rust' IN main, kb; RELATED TO kb.12;
   CREATE USER bob IDENTIFIED BY '...'; GRANT READ, WRITE ON kb TO bob;
   REVOKE WRITE ON kb FROM bob; SHOW GRANTS FOR bob; DROP USER bob;
+事务:
+  BEGIN; INSERT INTO memories (content) VALUES ('草稿');
+  -- 发现写错了:
+  ROLLBACK;
+  -- 确认无误后:
+  BEGIN; UPDATE memories SET importance = 0.9 WHERE id = 3; COMMIT;
 说明:
   SEARCH / RELATED 按 BM25 相关度 + 共现联想 + 关键词相似度重排,
   返回列 id/score/content/keywords/tags/importance(score 为相关度分数)。
@@ -104,6 +110,18 @@ pub fn run_local(mut backend: LocalBackend, user: &str, cfg: &LoadedConfig) -> R
                 }
             }
             Err(e) => eprintln!("error: {e}"),
+        }
+    }
+    // 会话结束仍有活动事务:未提交的修改按 ROLLBACK 处理(类数据库断连语义)。
+    if session.in_transaction() {
+        eprintln!("note: exiting with an open transaction; rolling back");
+        let host: &mut dyn SessionBackend = match &mut backend {
+            LocalBackend::Single(db) => db,
+            LocalBackend::Cluster(cluster) => cluster,
+        };
+        if let Err(e) = nebula_engine::rollback_txn(host, &mut session) {
+            nebula_core::log_error!("rollback on exit failed: {e}");
+            eprintln!("warning: rollback on exit failed: {e}");
         }
     }
     // 退出前落盘:单文件或集群(含用户/授权)全部持久化。

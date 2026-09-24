@@ -23,7 +23,7 @@ use nebula_crypto::{
 };
 use nebula_cluster::Cluster;
 use nebula_engine::{
-    executor, Database, EngineConfig, Session, SessionBackend,
+    executor, rollback_txn, Database, EngineConfig, Session, SessionBackend,
 };
 use nebula_storage::page::{HEADER_PREFIX_LEN, MAGIC, SALT_OFFSET};
 use nebula_tokenizer::ExtractorConfig;
@@ -230,10 +230,23 @@ pub fn serve_until(
                 }
                 let backend = backend.clone();
                 thread::spawn(move || {
-                    if let Err(e) = handle_conn(stream, backend) {
-                        if !matches!(&e, nebula_core::Error::Protocol(m) if m == "connection closed")
-                        {
-                            eprintln!("connection error: {e}");
+                    // catch_unwind 兜底:连接处理即使意外 panic,
+                    // 也只结束本线程并记录,绝不波及 accept 循环。
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        handle_conn(stream, backend)
+                    }));
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            let benign = matches!(&e, nebula_core::Error::Protocol(m) if m == "connection closed");
+                            if benign {
+                                nebula_core::log_debug!("connection closed by peer");
+                            } else {
+                                nebula_core::log_warn!("connection error: {e}");
+                            }
+                        }
+                        Err(_) => {
+                            nebula_core::log_error!("connection handler panicked; connection dropped");
                         }
                     }
                 });
@@ -322,6 +335,15 @@ fn handle_conn(mut stream: TcpStream, backend: ConnBackend) -> Result<()> {
     if !known || !ct_eq(&expected, &proof) {
         stream.write_all(&[STATUS_FAIL])?;
         stream.flush()?;
+        // 记录认证失败(不含任何密码/证明材料);便于发现暴力尝试。
+        nebula_core::log_warn!(
+            "authentication failed for user '{}' from {}",
+            user,
+            stream
+                .peer_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "unknown".into())
+        );
         return Err(nebula_core::Error::Auth("authentication failed".into()));
     }
     stream.write_all(&[STATUS_OK])?;
@@ -335,7 +357,7 @@ fn handle_conn(mut stream: TcpStream, backend: ConnBackend) -> Result<()> {
     loop {
         let payload = match read_frame(&mut stream, &frame_key, Direction::Up, req_seq) {
             Ok(p) => p,
-            Err(nebula_core::Error::Protocol(m)) if m == "connection closed" => return Ok(()),
+            Err(nebula_core::Error::Protocol(m)) if m == "connection closed" => break,
             Err(e) => return Err(e),
         };
         req_seq += 1;
@@ -348,8 +370,33 @@ fn handle_conn(mut stream: TcpStream, backend: ConnBackend) -> Result<()> {
         write_frame(&mut stream, &frame_key, Direction::Down, resp_seq, &out)?;
         resp_seq += 1;
         if is_close {
-            return Ok(());
+            break;
         }
+    }
+
+    // 连接断开时仍有活动事务:未提交的修改必须回滚,避免遗留半事务状态。
+    if sql_session.in_transaction() {
+        cleanup_open_transaction(&backend, &mut sql_session);
+    }
+    Ok(())
+}
+
+/// 断连清理:在共享后端上回滚连接遗留的事务;任何失败只记录日志,
+/// 不影响连接关闭流程。
+fn cleanup_open_transaction(backend: &ConnBackend, sql_session: &mut Session) {
+    let outcome = match backend {
+        ConnBackend::Single { db, .. } => match db.lock() {
+            Ok(mut guard) => rollback_txn(&mut *guard, sql_session),
+            Err(_) => Err(nebula_core::Error::Engine("db mutex poisoned".into())),
+        },
+        ConnBackend::Cluster { cluster } => match cluster.lock() {
+            Ok(mut guard) => rollback_txn(&mut *guard, sql_session),
+            Err(_) => Err(nebula_core::Error::Engine("cluster mutex poisoned".into())),
+        },
+    };
+    match outcome {
+        Ok(()) => nebula_core::log_info!("open transaction rolled back on disconnect"),
+        Err(e) => nebula_core::log_error!("rollback on disconnect failed: {e}"),
     }
 }
 
@@ -381,7 +428,12 @@ fn dispatch_request(
             };
             match outcome {
                 Ok(resp) => Ok(resp),
-                Err(e) => Ok(Response::error(e.to_string())),
+                Err(e) => {
+                    // 权限拒绝/SQL 错误:用户能看到 ok=false,日志里也留一条,
+                    // 便于事后定位频繁失败的操作。
+                    nebula_core::log_info!("sql failed for user '{}': {e}", sql_session.user());
+                    Ok(Response::error(e.to_string()))
+                }
             }
         }
     }
@@ -406,7 +458,10 @@ fn run_sql(
     }
     // 多语句:script 携带全部结果,主字段保留最后一个
     let script: Vec<Response> = results.iter().map(to_response).collect();
-    let last = to_response(results.last().unwrap());
+    let Some(last_ref) = results.last() else {
+        return Ok(Response::error("empty script"));
+    };
+    let last = to_response(last_ref);
     Ok(Response {
         script: Some(script),
         ..last

@@ -16,4 +16,4 @@ pub use cache::{DocCache, QueryCache};
 pub use config::{CacheConfig, EngineConfig, SearchConfig};
 pub use database::normalize_db_name;
 pub use database::Database;
-pub use executor::QueryResult;
+pub use executor::{rollback_txn, QueryResult};

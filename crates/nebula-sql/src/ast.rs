@@ -50,6 +50,12 @@ pub enum Statement {
     ShowUsers,
     /// SHOW GRANTS [FOR user] —— 用户授权。
     ShowGrants(ShowGrantsStmt),
+    /// BEGIN [WORK] / START TRANSACTION —— 开始事务。
+    Begin,
+    /// COMMIT [WORK] —— 提交事务。
+    Commit,
+    /// ROLLBACK [WORK] —— 回滚事务。
+    Rollback,
 }
 
 /// SEARCH 语句:自然语言查询 + 显式库列表 + 可选条数上限。
@@ -331,6 +337,9 @@ impl Statement {
             Statement::ShowDatabases => "show-databases",
             Statement::ShowUsers => "show-users",
             Statement::ShowGrants(_) => "show-grants",
+            Statement::Begin => "begin",
+            Statement::Commit => "commit",
+            Statement::Rollback => "rollback",
         }
     }
 }

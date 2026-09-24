@@ -118,6 +118,13 @@ pub trait MemBackend {
 
     /// CHECKPOINT:同步索引快照。
     fn checkpoint(&mut self) -> Result<()>;
+
+    /// 开启/关闭持久化延迟(事务期间由 executor 控制):
+    /// - 开启时,写操作只改内存数据结构,**不提交文件 catalog、不写索引快照**;
+    /// - 关闭后,调用方通常紧跟一次 [`checkpoint`](Self::checkpoint) 落盘。
+    ///
+    /// 这样进程在事务中崩溃后,重开的文件完全处于事务前状态。
+    fn set_persistence_deferred(&mut self, deferred: bool);
 }
 
 /// 会话后端:同时提供数据操作([`MemBackend`])与用户目录([`UserDirectory`])。

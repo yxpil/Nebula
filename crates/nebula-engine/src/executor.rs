@@ -18,7 +18,7 @@ use nebula_sql::ast::{
     RelatedStmt, SearchStmt, SelectColumn, SelectStmt, Statement,
 };
 
-use crate::auth::{require_admin, require_priv, Session};
+use crate::auth::{require_admin, require_priv, Session, UndoAction};
 use crate::backend::{RankedRow, SessionBackend};
 use crate::Database;
 use crate::format::{
@@ -117,9 +117,20 @@ pub fn dispatch(
     let user = session.user().to_string();
     let current = session.current_db().to_string();
     match stmt {
+        Statement::Begin => {
+            // 不支持嵌套:重复 BEGIN 明确报错而不是静默重置。
+            session.begin_txn()?;
+            host.set_persistence_deferred(true);
+            nebula_core::log_info!("transaction started by user '{user}'");
+            Ok(QueryResult::message(
+                "transaction started; changes will be held in memory until COMMIT",
+            ))
+        }
+        Statement::Commit => exec_commit(host, session),
+        Statement::Rollback => exec_rollback(host, session),
         Statement::Insert(ins) => {
             require_priv(host, &user, &current, Privilege::Write)?;
-            exec_insert(host, &current, ins)
+            exec_insert(host, session, &current, ins)
         }
         Statement::Select(sel) => {
             require_priv(host, &user, &current, Privilege::Read)?;
@@ -127,11 +138,11 @@ pub fn dispatch(
         }
         Statement::Delete(del) => {
             require_priv(host, &user, &current, Privilege::Write)?;
-            exec_delete(host, &current, del.filter.as_ref())
+            exec_delete(host, session, &current, del.filter.as_ref())
         }
         Statement::Update(upd) => {
             require_priv(host, &user, &current, Privilege::Write)?;
-            exec_update(host, &current, &upd.assignments, upd.filter.as_ref())
+            exec_update(host, session, &current, &upd.assignments, upd.filter.as_ref())
         }
         Statement::Search(s) => {
             let dbs = resolve_dbs(host, s.dbs.as_slice(), &current)?;
@@ -149,6 +160,7 @@ pub fn dispatch(
         }
         Statement::CreateDatabase(s) => {
             require_admin(host, &user)?;
+            implicit_commit(host, session)?;
             let created = host.create_db(&s.name)?;
             if !created && !s.if_not_exists {
                 return Err(nebula_core::Error::Sql(format!(
@@ -163,6 +175,7 @@ pub fn dispatch(
         }
         Statement::DropDatabase(s) => {
             require_admin(host, &user)?;
+            implicit_commit(host, session)?;
             if !host.db_exists(&s.name) {
                 if s.if_exists {
                     return Ok(QueryResult::message(format!(
@@ -195,6 +208,7 @@ pub fn dispatch(
         }
         Statement::Attach(s) => {
             require_admin(host, &user)?;
+            implicit_commit(host, session)?;
             host.attach_file(&s.path, &s.name)?;
             Ok(QueryResult::message(format!(
                 "OK, file '{}' attached as database '{}'",
@@ -203,6 +217,7 @@ pub fn dispatch(
         }
         Statement::Detach(s) => {
             require_admin(host, &user)?;
+            implicit_commit(host, session)?;
             host.detach_db(&s.name)?;
             Ok(QueryResult::message(format!(
                 "OK, database '{}' detached",
@@ -211,6 +226,7 @@ pub fn dispatch(
         }
         Statement::CreateUser(s) => {
             require_admin(host, &user)?;
+            implicit_commit(host, session)?;
             let created = host.create_user(&s.name, &s.password, s.if_not_exists)?;
             Ok(QueryResult::message(format!(
                 "OK, user '{}' {}",
@@ -220,6 +236,7 @@ pub fn dispatch(
         }
         Statement::DropUser(s) => {
             require_admin(host, &user)?;
+            implicit_commit(host, session)?;
             let removed = host.drop_user(&s.name, s.if_exists)?;
             Ok(QueryResult::message(format!(
                 "OK, user '{}' {}",
@@ -229,6 +246,7 @@ pub fn dispatch(
         }
         Statement::AlterUser(s) => {
             require_admin(host, &user)?;
+            implicit_commit(host, session)?;
             host.alter_user(&s.name, &s.password)?;
             Ok(QueryResult::message(format!(
                 "OK, password changed for user '{}'",
@@ -237,6 +255,7 @@ pub fn dispatch(
         }
         Statement::Grant(s) => {
             require_admin(host, &user)?;
+            implicit_commit(host, session)?;
             host.grant(&s.user, &s.object, &s.privileges)?;
             Ok(QueryResult::message(format!(
                 "OK, privileges granted to '{}'",
@@ -245,6 +264,7 @@ pub fn dispatch(
         }
         Statement::Revoke(s) => {
             require_admin(host, &user)?;
+            implicit_commit(host, session)?;
             host.revoke(&s.user, &s.object, &s.privileges)?;
             Ok(QueryResult::message(format!(
                 "OK, privileges revoked from '{}'",
@@ -287,6 +307,13 @@ pub fn dispatch(
         }
         Statement::Checkpoint => {
             require_admin(host, &user)?;
+            // 清晰错误优先于后端内部的 deferred 保护。
+            if session.in_transaction() {
+                return Err(nebula_core::Error::Sql(
+                    "cannot CHECKPOINT while a transaction is active; run COMMIT or ROLLBACK first"
+                        .into(),
+                ));
+            }
             host.checkpoint()?;
             Ok(QueryResult::message("checkpoint done"))
         }
@@ -299,9 +326,19 @@ pub fn dispatch(
         }
         Statement::ShowStatus => {
             require_priv(host, &user, &current, Privilege::Read)?;
+            // 追加事务状态,便于确认 USE/事务是否活动。
+            let mut rows = host.status_rows();
+            rows.push(vec![
+                "transaction".into(),
+                if session.in_transaction() {
+                    "active".into()
+                } else {
+                    "none".into()
+                },
+            ]);
             Ok(QueryResult::table(
                 vec!["Variable".into(), "Value".into()],
-                host.status_rows(),
+                rows,
             ))
         }
         Statement::ShowDatabases => Ok(QueryResult::table(
@@ -335,6 +372,84 @@ pub fn dispatch(
             Ok(QueryResult::table(vec!["Grants".into()], rows))
         }
     }
+}
+
+// ------- 事务:提交 / 回滚编排 -------
+
+/// DDL 前的隐式提交:若当前有活动事务,先把它提交掉(类 MySQL 语义),
+/// 避免"事务中执行不可逆 DDL"导致的回滚歧义。
+fn implicit_commit(host: &mut dyn SessionBackend, session: &mut Session) -> Result<()> {
+    if session.in_transaction() {
+        // 丢弃 undo:提交即认可全部修改。
+        session.take_txn();
+        host.set_persistence_deferred(false);
+        host.checkpoint()?;
+        nebula_core::log_info!("transaction auto-committed before a DDL statement");
+    }
+    Ok(())
+}
+
+/// COMMIT 语句:认可事务中的全部修改并立即落盘。
+fn exec_commit(host: &mut dyn SessionBackend, session: &mut Session) -> Result<QueryResult> {
+    if session.take_txn().is_none() {
+        return Err(nebula_core::Error::Sql(
+            "no active transaction to commit".into(),
+        ));
+    }
+    host.set_persistence_deferred(false);
+    host.checkpoint()?;
+    nebula_core::log_info!("transaction committed");
+    Ok(QueryResult::message("transaction committed"))
+}
+
+/// ROLLBACK 语句:撤销事务中的全部修改。
+fn exec_rollback(host: &mut dyn SessionBackend, session: &mut Session) -> Result<QueryResult> {
+    rollback_txn(host, session)?;
+    Ok(QueryResult::message("transaction rolled back"))
+}
+
+/// 回滚活动事务。
+///
+/// [`Statement::Rollback`] 与会话/连接结束时的清理共用本函数;
+/// 无活动事务时返回错误(语句显式调用时)——调用方在会话清理场景
+/// 可先检查 [`Session::in_transaction`]。
+pub fn rollback_txn(host: &mut dyn SessionBackend, session: &mut Session) -> Result<()> {
+    let Some(txn) = session.take_txn() else {
+        return Err(nebula_core::Error::Sql(
+            "no active transaction to roll back".into(),
+        ));
+    };
+    // 反向应用 undo;期间持久化仍延迟,undo 的写操作不会半部落盘。
+    let undos = txn.into_undos();
+    if undos.is_empty() {
+        nebula_core::log_info!("transaction rolled back (read-only; no changes)");
+    } else {
+        for action in undos.into_iter().rev() {
+            apply_undo(host, action)?;
+        }
+        nebula_core::log_info!("transaction rolled back; pre-transaction state restored");
+    }
+    host.set_persistence_deferred(false);
+    host.checkpoint()
+}
+
+/// 应用单条 undo(直接操作后端,不再产生新 undo)。
+fn apply_undo(host: &mut dyn SessionBackend, action: UndoAction) -> Result<()> {
+    match action {
+        UndoAction::Inserted { db, id } => {
+            host.delete_mems(&db, &[id])?;
+        }
+        UndoAction::Deleted { db, records } => {
+            // 记录原样写回:put 新页 + 重建索引(旧页已释放也不影响)。
+            for rec in records {
+                host.replace_mem(&db, &rec)?;
+            }
+        }
+        UndoAction::Replaced { db, old } => {
+            host.replace_mem(&db, &old)?;
+        }
+    }
+    Ok(())
 }
 
 /// 库列表解析:空 = 当前库;非空时去重并校验全部存在。
@@ -409,6 +524,7 @@ fn dedup_keep(items: &[String]) -> Vec<String> {
 
 fn exec_insert(
     backend: &mut dyn SessionBackend,
+    session: &mut Session,
     db: &str,
     ins: &InsertStmt,
 ) -> Result<QueryResult> {
@@ -456,6 +572,13 @@ fn exec_insert(
         ));
     }
     let id = backend.insert_mem(db, content, tags, source, importance)?;
+    // 事务中:记录撤销动作(插入失败不会走到这里)。
+    if session.in_transaction() {
+        session.record_undo(UndoAction::Inserted {
+            db: db.to_string(),
+            id,
+        })?;
+    }
     Ok(QueryResult {
         columns: Vec::new(),
         rows: Vec::new(),
@@ -617,6 +740,7 @@ fn materialize_ranked(
 
 fn exec_delete(
     backend: &mut dyn SessionBackend,
+    session: &mut Session,
     db: &str,
     filter: Option<&Expr>,
 ) -> Result<QueryResult> {
@@ -626,6 +750,21 @@ fn exec_delete(
         ));
     };
     let ids = candidate_ids(backend, db, expr);
+    // 事务中:删除前取回完整记录,供 ROLLBACK 原样写回。
+    if session.in_transaction() && !ids.is_empty() {
+        let mut records = Vec::with_capacity(ids.len());
+        for id in &ids {
+            if let Some(rec) = backend.fetch_mem(db, *id)? {
+                records.push(rec);
+            }
+        }
+        if !records.is_empty() {
+            session.record_undo(UndoAction::Deleted {
+                db: db.to_string(),
+                records,
+            })?;
+        }
+    }
     let count = backend.delete_mems(db, &ids)?;
     Ok(QueryResult {
         columns: Vec::new(),
@@ -637,6 +776,7 @@ fn exec_delete(
 
 fn exec_update(
     backend: &mut dyn SessionBackend,
+    session: &mut Session,
     db: &str,
     assignments: &[(String, Literal)],
     filter: Option<&Expr>,
@@ -649,6 +789,12 @@ fn exec_update(
     for id in ids {
         let Some(mut rec) = backend.fetch_mem(db, id)? else {
             continue;
+        };
+        // 先留存旧记录:事务中若实际改动,用于 ROLLBACK。
+        let old_rec = if session.in_transaction() {
+            Some(rec.clone())
+        } else {
+            None
         };
         let mut changed = false;
         for (col, value) in assignments {
@@ -690,6 +836,12 @@ fn exec_update(
         }
         if changed {
             backend.replace_mem(db, &rec)?;
+            if let Some(old) = old_rec {
+                session.record_undo(UndoAction::Replaced {
+                    db: db.to_string(),
+                    old,
+                })?;
+            }
             updated += 1;
         }
     }
@@ -1016,6 +1168,9 @@ mod tests {
             fn checkpoint(&mut self) -> Result<()> {
                 self.db.checkpoint()
             }
+            fn set_persistence_deferred(&mut self, deferred: bool) {
+                self.db.set_persistence_deferred(deferred)
+            }
         }
 
         struct Restricted;
@@ -1089,5 +1244,167 @@ mod tests {
         assert!(r.rows.iter().any(|x| x[0] == "query_cache_capacity"));
         let r = d.execute("SHOW STATUS").unwrap();
         assert!(r.rows.iter().any(|x| x[0] == "databases"));
+    }
+
+    // ---------- 事务 ----------
+
+    #[test]
+    fn transaction_rollback_restores_insert_update_delete() {
+        let mut d = db("txn_rb");
+        let mut s = Session::admin();
+        // 事务前的已提交基线:id=1, importance=0.5
+        run(
+            &mut d,
+            &mut s,
+            "INSERT INTO memories VALUES ('旧内容', 'k1', 't1', 0.5)",
+        )
+        .unwrap();
+
+        run(&mut d, &mut s, "BEGIN").unwrap();
+        run(
+            &mut d,
+            &mut s,
+            "INSERT INTO memories (content) VALUES ('事务内新增')",
+        )
+        .unwrap(); // id=2
+        run(&mut d, &mut s, "UPDATE memories SET importance = 0.1 WHERE id = 1").unwrap();
+        run(&mut d, &mut s, "DELETE FROM memories WHERE id = 1").unwrap();
+        // 事务内:改动对当前会话可见(只剩 id=2)。
+        assert_eq!(
+            run(&mut d, &mut s, "SELECT id FROM memories").unwrap().rows.len(),
+            1
+        );
+
+        run(&mut d, &mut s, "ROLLBACK").unwrap();
+        assert!(!s.in_transaction());
+        // 全部恢复:新增消失,被删/改的旧记录原样回来。
+        let r = run(&mut d, &mut s, "SELECT id, importance FROM memories").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], "1");
+        assert_eq!(r.rows[0][1], "0.50");
+    }
+
+    #[test]
+    fn transaction_commit_persists_to_disk() {
+        let mut d = db("txn_commit");
+        let path = d.path().to_path_buf();
+        let mut s = Session::admin();
+        run(&mut d, &mut s, "BEGIN").unwrap();
+        run(
+            &mut d,
+            &mut s,
+            "INSERT INTO memories (content) VALUES ('已提交内容')",
+        )
+        .unwrap();
+        run(&mut d, &mut s, "COMMIT").unwrap();
+        assert!(!s.in_transaction());
+        assert_eq!(
+            run(&mut d, &mut s, "SELECT id FROM memories").unwrap().rows.len(),
+            1
+        );
+        d.close().unwrap();
+        // 重开数据库:COMMIT 的修改必须仍在。
+        let mut d2 = Database::open(&path, PW).unwrap();
+        assert_eq!(
+            d2.execute("SELECT id FROM memories").unwrap().rows.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn transaction_control_statements_reject_invalid_use() {
+        let mut d = db("txn_ctrl");
+        let mut s = Session::admin();
+        // 无活动事务:提交/回滚都应报错。
+        assert!(run(&mut d, &mut s, "COMMIT").is_err());
+        assert!(run(&mut d, &mut s, "ROLLBACK").is_err());
+        // 嵌套事务不允许。
+        run(&mut d, &mut s, "BEGIN").unwrap();
+        assert!(run(&mut d, &mut s, "BEGIN").is_err());
+        // 事务中不能手工 checkpoint(会绕过延迟持久化保护)。
+        assert!(run(&mut d, &mut s, "CHECKPOINT").is_err());
+        // 收尾:回滚后恢复正常状态。
+        run(&mut d, &mut s, "ROLLBACK").unwrap();
+        assert!(!s.in_transaction());
+    }
+
+    #[test]
+    fn ddl_implicitly_commits_open_transaction() {
+        let mut d = db("txn_ddl");
+        let mut s = Session::admin();
+        run(
+            &mut d,
+            &mut s,
+            "INSERT INTO memories (content) VALUES ('基线')",
+        )
+        .unwrap();
+        run(&mut d, &mut s, "BEGIN").unwrap();
+        run(
+            &mut d,
+            &mut s,
+            "INSERT INTO memories (content) VALUES ('事务内写入')",
+        )
+        .unwrap();
+        // DDL 无法用 undo 撤销(涉及建库物理操作):执行前隐式提交。
+        run(&mut d, &mut s, "CREATE DATABASE work").unwrap();
+        assert!(!s.in_transaction(), "DDL 后事务应已自动提交");
+        // 两条记录均已落盘可见。
+        assert_eq!(
+            run(&mut d, &mut s, "SELECT id FROM memories").unwrap().rows.len(),
+            2
+        );
+        // 事务已不存在:回滚报错,改动不会被撤销。
+        assert!(run(&mut d, &mut s, "ROLLBACK").is_err());
+    }
+
+    #[test]
+    fn uncommitted_changes_are_invisible_after_crash_reopen() {
+        let mut d = db("txn_crash");
+        let path = d.path().to_path_buf();
+        let mut s = Session::admin();
+        run(
+            &mut d,
+            &mut s,
+            "INSERT INTO memories VALUES ('基线', 'k', 't', 0.5)",
+        )
+        .unwrap();
+        d.close().unwrap();
+
+        // 场景一:事务未提交时"进程崩溃"。
+        // drop 只会尽力 checkpoint,而 deferred 状态下 checkpoint 被拒,
+        // catalog 从未提交 —— 等价于进程异常退出。
+        let mut d = Database::open(&path, PW).unwrap();
+        run(&mut d, &mut s, "BEGIN").unwrap();
+        run(
+            &mut d,
+            &mut s,
+            "INSERT INTO memories (content) VALUES ('未提交内容')",
+        )
+        .unwrap();
+        drop(d);
+        let mut d2 = Database::open(&path, PW).unwrap();
+        assert_eq!(
+            d2.execute("SELECT id FROM memories").unwrap().rows.len(),
+            1,
+            "崩溃重开后未提交数据必须不可见"
+        );
+
+        // 场景二对照:COMMIT 之后即使进程崩溃,数据也必须保留。
+        let mut s2 = Session::admin();
+        run(&mut d2, &mut s2, "BEGIN").unwrap();
+        run(
+            &mut d2,
+            &mut s2,
+            "INSERT INTO memories (content) VALUES ('已提交内容')",
+        )
+        .unwrap();
+        run(&mut d2, &mut s2, "COMMIT").unwrap();
+        drop(d2);
+        let mut d3 = Database::open(&path, PW).unwrap();
+        assert_eq!(
+            d3.execute("SELECT id FROM memories").unwrap().rows.len(),
+            2,
+            "COMMIT 后崩溃重开数据必须仍在"
+        );
     }
 }

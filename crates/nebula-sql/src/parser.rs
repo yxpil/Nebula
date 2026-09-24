@@ -159,6 +159,28 @@ impl Parser {
                 self.next();
                 Ok(Statement::Checkpoint)
             }
+            "begin" => {
+                self.next();
+                // BEGIN [WORK]
+                let _ = self.eat_word("work");
+                Ok(Statement::Begin)
+            }
+            "start" => {
+                // START TRANSACTION
+                self.expect_word("start")?;
+                self.expect_word("transaction")?;
+                Ok(Statement::Begin)
+            }
+            "commit" => {
+                self.next();
+                let _ = self.eat_word("work");
+                Ok(Statement::Commit)
+            }
+            "rollback" => {
+                self.next();
+                let _ = self.eat_word("work");
+                Ok(Statement::Rollback)
+            }
             "show" => self.show_stmt(),
             other => Err(Error::Sql(format!("unsupported statement '{other}'"))),
         }

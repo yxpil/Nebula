@@ -35,6 +35,8 @@ fn main() -> ExitCode {
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
+            // logger 可能已初始化:致命错误留档;未初始化时该调用静默。
+            nebula_core::log_error!("fatal: {e}");
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
@@ -83,6 +85,8 @@ fn print_help() {
   检索与联想相关参数在 [engine.search] 段(BM25 k1/b、联想跳数、扩展衰减、相似度权重等);
   查询/文档缓存容量与热点预加载条数在 [engine.cache] 段,
   也可在会话内用 SET CACHE query|doc <n> 在线调整(SHOW CACHE 查看命中统计)。
+  运行诊断日志(级别/文件/大小上限)在 [logging] 段,默认写入配置目录内 nebula.log。
+  事务支持:BEGIN ... COMMIT 提交,或 ROLLBACK 撤销未提交的修改。
 
 其他:
   NEBULA_PASSWORD   环境变量提供密码(跳过终端输入,便于脚本)
@@ -122,9 +126,27 @@ fn load_or_create_config(dir: &Path) -> Result<LoadedConfig> {
     nebula_config::NebulaConfig::load_dir(dir)
 }
 
+/// 按 `[logging]` 配置初始化全局诊断日志。
+///
+/// 日志是附属能力:初始化失败只在终端告警,程序继续运行。
+fn init_logging(cfg: &LoadedConfig) {
+    let lg = &cfg.config.logging;
+    if !lg.enabled {
+        return;
+    }
+    let Some(level) = nebula_core::LogLevel::parse(&lg.level) else {
+        return; // validate 已保证合法,此处防御性返回
+    };
+    let path = cfg.dir.join(&lg.file);
+    if let Err(e) = nebula_core::init_logger(&path, level, lg.max_size) {
+        eprintln!("warning: cannot initialize file logging ({e}); continuing without it");
+    }
+}
+
 fn cmd_create(args: &[String]) -> Result<()> {
     let opts = Opts::parse(args)?;
     let cfg = load_or_create_config(&resolve_config_dir(&opts, opts.db.as_deref()))?;
+    init_logging(&cfg);
     if let Some(dir) = &opts.dir {
         // 目录集群:初始化(main.ndb + _admin.ndb,admin 密码即集群密码)
         if opts.db.is_some() {
@@ -195,6 +217,7 @@ fn cmd_create(args: &[String]) -> Result<()> {
 fn cmd_open(args: &[String]) -> Result<()> {
     let opts = Opts::parse(args)?;
     let cfg = load_or_create_config(&resolve_config_dir(&opts, opts.db.as_deref()))?;
+    init_logging(&cfg);
     let password = prompt_password()?;
     if let Some(dir) = &opts.dir {
         if opts.db.is_some() {
@@ -227,6 +250,7 @@ fn cmd_open(args: &[String]) -> Result<()> {
 fn cmd_serve(args: &[String]) -> Result<()> {
     let opts = Opts::parse(args)?;
     let cfg = load_or_create_config(&resolve_config_dir(&opts, opts.db.as_deref()))?;
+    init_logging(&cfg);
     let password = prompt_password()?;
     let addr = opts
         .addr
@@ -266,6 +290,7 @@ fn cmd_connect(args: &[String]) -> Result<()> {
         return Err(Error::Sql("connect uses --addr, not --dir".into()));
     }
     let cfg = load_or_create_config(&resolve_config_dir(&opts, None))?;
+    init_logging(&cfg);
     let addr = opts
         .addr
         .clone()

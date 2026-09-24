@@ -51,6 +51,8 @@ pub struct Database {
     pub(crate) query_cache: QueryCache,
     /// 记忆记录 LRU 缓存(读路径自动填充,写路径同步维护)。
     pub(crate) doc_cache: DocCache,
+    /// 持久化延迟开关:事务期间为 true,跳过 catalog 提交与快照写入。
+    pub(crate) persistence_deferred: bool,
 }
 
 impl Database {
@@ -90,6 +92,7 @@ impl Database {
             cfg: cfg.clone(),
             query_cache: QueryCache::new(cfg.cache.query_cache_capacity),
             doc_cache: DocCache::new(cfg.cache.doc_cache_capacity),
+            persistence_deferred: false,
         };
         // 仅空索引(空快照/空文件)补默认库;已有库的文件原样打开,
         // 避免把 main 强塞进集群的单库受管文件。
@@ -189,6 +192,7 @@ impl Database {
             cfg: cfg.clone(),
             query_cache: QueryCache::new(cfg.cache.query_cache_capacity),
             doc_cache: DocCache::new(cfg.cache.doc_cache_capacity),
+            persistence_deferred: false,
         })
     }
 
@@ -315,14 +319,17 @@ impl Database {
         let terms = term_counts(&self.extractor.tokenize(&record.content));
         self.index.upsert(db, &record, &terms, loc);
         self.file.set_memory_count(self.index.total_len() as u64);
-        self.file.commit_catalog()?;
+        // 事务期间(持久化延迟)只改内存,catalog 不落盘。
+        if !self.persistence_deferred {
+            self.file.commit_catalog()?;
+        }
 
         // 缓存维护:新记录 fill 文档缓存;写操作使 BM25 的 df / avgdl 变化,
         // 查询缓存必须整体失效,否则旧排序不再可信。
         self.doc_cache.put(db, record.id, record.clone());
         self.query_cache.invalidate();
 
-        if self.file.dirty_records() >= self.cfg.auto_checkpoint {
+        if !self.persistence_deferred && self.file.dirty_records() >= self.cfg.auto_checkpoint {
             self.checkpoint()?;
         }
         Ok(record.id)
@@ -371,12 +378,16 @@ impl Database {
             }
         }
         self.file.set_memory_count(self.index.total_len() as u64);
-        self.file.commit_catalog()?;
+        if !self.persistence_deferred {
+            self.file.commit_catalog()?;
+        }
         // 索引位置已变,必须重写快照,否则重开后索引会指向旧页。
         // 缓存维护:文档缓存 fill 新记录;查询缓存整体失效。
         self.doc_cache.put(db, record.id, record.clone());
         self.query_cache.invalidate();
-        self.checkpoint()?;
+        if !self.persistence_deferred {
+            self.checkpoint()?;
+        }
         Ok(())
     }
 
@@ -392,15 +403,27 @@ impl Database {
         }
         if removed > 0 {
             self.file.set_memory_count(self.index.total_len() as u64);
-            self.file.commit_catalog()?;
+            if !self.persistence_deferred {
+                self.file.commit_catalog()?;
+            }
             self.query_cache.invalidate();
-            self.checkpoint()?;
+            if !self.persistence_deferred {
+                self.checkpoint()?;
+            }
         }
         Ok(removed)
     }
 
     /// 写索引快照(单页目录提交 = 原子切换)。
     pub(crate) fn checkpoint(&mut self) -> Result<()> {
+        // 延迟持久化期间禁止落盘(executor 正常会在 COMMIT/ROLLBACK 后调用,
+        // 此处防止任何路径绕过)。
+        if self.persistence_deferred {
+            return Err(nebula_core::Error::Engine(
+                "cannot checkpoint while persistence is deferred (run COMMIT or ROLLBACK first)"
+                    .into(),
+            ));
+        }
         let bytes = self.index.encode_snapshot();
         self.file.write_index_snapshot(&bytes)?;
         self.file.commit_catalog()
@@ -659,6 +682,10 @@ impl MemBackend for Database {
     fn checkpoint(&mut self) -> Result<()> {
         Database::checkpoint(self)
     }
+
+    fn set_persistence_deferred(&mut self, deferred: bool) {
+        self.persistence_deferred = deferred;
+    }
 }
 
 impl Database {
@@ -839,7 +866,12 @@ pub fn normalize_db_name(db: &str) -> Result<String> {
         )));
     }
     let mut chars = name.chars();
-    let first = chars.next().unwrap();
+    // 前置 is_empty 已保证有首字符;此处防御性处理,不依赖 unwrap。
+    let Some(first) = chars.next() else {
+        return Err(nebula_core::Error::Engine(
+            "database name must not be empty".into(),
+        ));
+    };
     if !first.is_ascii_alphabetic() && first != '_' {
         return Err(nebula_core::Error::Engine(
             "database name must start with a letter or underscore".into(),
