@@ -1,17 +1,26 @@
-//! Nebula 有线协议:v1。
+//! Nebula 有线协议:v2(多用户)。
 //!
-//! # 握手(挑战 - 应答,防重放)
+//! # 握手(两步身份声明 + 挑战 - 应答,防重放)
 //!
 //! ```text
-//! server ──▶ hello: b"NEBULA1"(7) || salt(16) || challenge(32)  共 55 字节
-//! client ──▶ proof: HMAC-SHA256(session_key, challenge)         共 32 字节
-//! server ──▶ status: 0x01 认证通过 / 0x00 认证失败(随后断开)
+//! client ──▶ hello:   b"NEBULA2"(7)
+//! server ──▶ ready:   0x02(1 字节,版本确认)
+//! client ──▶ identity:varint 用户名长度 || 用户名(UTF-8)
+//! server ──▶ challenge:salt(16) || challenge(32)         共 48 字节
+//! client ──▶ proof:   HMAC-SHA256(session_key, challenge) 共 32 字节
+//! server ──▶ status:  0x01 认证通过 / 0x00 认证失败(随后断开)
 //! ```
 //!
-//! 客户端只需知道密码:
-//! - `master = Argon2id(password, salt)`(盐在 hello 中原样带回,公开值)
-//! - `session_key = HKDF-SHA256(master, "nebula/session/v1" || challenge)`
+//! 两步身份声明的原因:集群模式每个用户有独立盐,客户端必须先告知用户名,
+//! 服务端才能把该用户记录中的盐原样带回。
+//!
+//! 客户端只需知道用户名与密码:
+//! - `master = Argon2id(password, salt)`(盐在 challenge 中原样带回,公开值)
+//! - `session_key = HKDF-SHA256(master, "nebula/session/v2" || challenge)`
 //! - `proof = HMAC-SHA256(session_key, challenge)`
+//!
+//! 单文件模式只接受 user="admin",salt 为文件头盐;集群模式由用户目录
+//! (nebula-cluster 的 _admin.ndb)解析盐与 Argon2id 验证器。
 //!
 //! challenge 每次连接新鲜 → proof 不可重放;密码不明文上网。
 //!
@@ -21,7 +30,7 @@
 //! [u32 BE 长度] || ChaCha20-Poly1305(nonce || 密文 || tag)
 //! ```
 //!
-//! AAD = `"nebula/frame/v1" || seq(u64 BE)`,序号收发双方各自递增,
+//! AAD = `"nebula/frame/up|down" || seq(u64 BE)`,序号收发双方各自递增,
 //! 重放/重排/注入的帧无法通过认证。载荷为 serde_json 的 [`Request`]/[`Response`]。
 
 use std::io::{Read, Write};
@@ -31,11 +40,15 @@ use nebula_core::{Error, Result};
 use nebula_crypto::{ct_eq, hkdf_sha256, hmac_sha256, open, seal, KEY_LEN, SALT_LEN};
 
 /// 协议魔数。
-pub const PROTOCOL_MAGIC: &[u8; 7] = b"NEBULA1";
+pub const PROTOCOL_MAGIC: &[u8; 7] = b"NEBULA2";
+/// 版本确认字节。
+pub const READY_BYTE: u8 = 0x02;
+/// 用户名最大长度。
+pub const MAX_USER_NAME: usize = 64;
 /// 挑战长度。
 pub const CHALLENGE_LEN: usize = 32;
-/// hello 总长:magic(7) + salt(16) + challenge(32)。
-pub const HELLO_LEN: usize = PROTOCOL_MAGIC.len() + SALT_LEN + CHALLENGE_LEN;
+/// challenge 帧总长:salt(16) + challenge(32)。
+pub const CHALLENGE_FRAME_LEN: usize = SALT_LEN + CHALLENGE_LEN;
 /// proof 长度(HMAC-SHA256 输出)。
 pub const PROOF_LEN: usize = KEY_LEN;
 /// 认证通过状态字节。
@@ -45,7 +58,7 @@ pub const STATUS_FAIL: u8 = 0;
 /// 单帧上限(16 MiB),防止恶意长度字段耗尽内存。
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// 会话密钥派生信息前缀。
-const SESSION_INFO: &[u8] = b"nebula/session/v1";
+const SESSION_INFO: &[u8] = b"nebula/session/v2";
 /// 帧 AAD 域分离前缀:client → server / server → client 两个方向各自独立编号。
 const FRAME_INFO_UP: &[u8] = b"nebula/frame/up";
 const FRAME_INFO_DOWN: &[u8] = b"nebula/frame/down";
@@ -127,6 +140,75 @@ pub fn session_key(master: &[u8; KEY_LEN], challenge: &[u8; CHALLENGE_LEN]) -> [
     info.extend_from_slice(SESSION_INFO);
     info.extend_from_slice(challenge);
     hkdf_sha256(master, &info)
+}
+
+/// 编码 LEB128 varint。
+pub fn put_varint(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// 解码 LEB128 varint。
+pub fn take_varint(bytes: &[u8]) -> Result<(u64, usize)> {
+    let mut result: u64 = 0;
+    let mut shift = 0u32;
+    for (i, &byte) in bytes.iter().enumerate() {
+        result |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Ok((result, i + 1));
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err(Error::Protocol("varint too long".into()));
+        }
+    }
+    Err(Error::Protocol("unexpected end of varint".into()))
+}
+
+/// 客户端写身份帧:varint 长度 + 用户名。
+pub fn write_identity(stream: &mut TcpStream, user: &str) -> Result<()> {
+    let bytes = user.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_USER_NAME {
+        return Err(Error::Protocol(format!(
+            "user name must be 1..{MAX_USER_NAME} bytes"
+        )));
+    }
+    let mut frame = Vec::with_capacity(bytes.len() + 1);
+    put_varint(&mut frame, bytes.len() as u64);
+    frame.extend_from_slice(bytes);
+    stream.write_all(&frame)?;
+    stream.flush()?;
+    Ok(())
+}
+
+/// 服务端读身份帧。
+pub fn read_identity(stream: &mut TcpStream) -> Result<String> {
+    // varint 长度 ≤ 64,第一字节即完整 varint。
+    let mut len_buf = [0u8; 1];
+    stream
+        .read_exact(&mut len_buf)
+        .map_err(|e| wrap_eof(e, "identity length"))?;
+    let (n, used) = take_varint(&len_buf)?;
+    debug_assert_eq!(used, 1);
+    let n = n as usize;
+    if n == 0 || n > MAX_USER_NAME {
+        return Err(Error::Protocol(format!(
+            "user name must be 1..{MAX_USER_NAME} bytes"
+        )));
+    }
+    let mut name = vec![0u8; n];
+    stream
+        .read_exact(&mut name)
+        .map_err(|e| wrap_eof(e, "identity body"))?;
+    String::from_utf8(name)
+        .map_err(|e| Error::Protocol(format!("invalid user name utf-8: {e}")))
 }
 
 /// 认证证明:HMAC-SHA256(session_key, challenge)。
