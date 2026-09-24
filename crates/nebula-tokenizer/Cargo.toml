@@ -9,3 +9,4 @@ description = "Nebula: jieba-rs based CN/EN tokenizer, keyword and key-point ext
 nebula-core = { path = "../nebula-core" }
 jieba-rs = "0.7"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"

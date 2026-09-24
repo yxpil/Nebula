@@ -25,7 +25,7 @@ use std::path::{Component, Path, PathBuf};
 use nebula_core::{Error, Result};
 use nebula_engine::EngineConfig;
 use nebula_storage::{MAX_PAGE_SIZE, MIN_PAGE_SIZE};
-use nebula_tokenizer::{load_stopwords_file, ExtractorConfig, DEFAULT_STOPWORDS};
+use nebula_tokenizer::{default_stopword_set, load_stopwords_file, ExtractorConfig};
 
 /// 配置目录后缀:`<库文件>.conf.d`。
 pub const CONFIG_DIR_SUFFIX: &str = "conf.d";
@@ -341,15 +341,17 @@ prompt = \"nebula> \"
 password_min_len = 8
 ";
 
-/// 默认停用词表模板文本(一行一词,# 注释)。
+/// 默认停用词表模板文本(一行一词,# 注释;词条排序保证输出稳定可复现)。
 pub fn stopwords_template() -> String {
     let mut out = String::from(
         "# Nebula 停用词表:一行一词,'#' 开头为注释行。\n\
          # 命中的词不进入关键词与关键点提取;修改后对后续 open/serve 生效。\n\
          # 可将整表清空(保留注释)以关闭停用词过滤。\n\n",
     );
-    for w in DEFAULT_STOPWORDS {
-        out.push_str(w);
+    let mut words: Vec<String> = default_stopword_set().into_iter().collect();
+    words.sort();
+    for w in words {
+        out.push_str(&w);
         out.push('\n');
     }
     out

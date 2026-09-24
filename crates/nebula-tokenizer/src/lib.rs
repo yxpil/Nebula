@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 pub mod stopwords;
 
-pub use stopwords::{default_stopword_set, load_stopwords_file, DEFAULT_STOPWORDS};
+pub use stopwords::{default_stopword_set, load_stopwords_file};
 
 use crate::stopwords::{is_cjk, is_noise, is_stopword};
 

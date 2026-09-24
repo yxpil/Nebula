@@ -497,6 +497,7 @@ dependencies = [
  "jieba-rs",
  "nebula-core",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
