@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>Nebula 测试报告 - windows-x64 (MSVC) local</title><style>
+:root { color-scheme: light; }
+* { box-sizing: border-box; }
+body { margin:0; font-family: 'Segoe UI', system-ui, sans-serif; background:#f4f5fb; color:#1b1e2e; }
+.hero { background:linear-gradient(120deg,#14152a,#2a1a4a); color:#fff; padding:38px 44px 30px; }
+.hero h1 { margin:0 0 6px; font-size:30px; }
+.hero .meta { color:#c6c9e4; font-size:14px; line-height:1.7; }
+.wrap { max-width:1080px; margin:0 auto; padding:26px 28px 60px; }
+.cards { display:flex; gap:16px; flex-wrap:wrap; margin:-52px 0 26px; position:relative; }
+.card { flex:1; min-width:150px; background:#fff; border-radius:14px; padding:18px 20px;
+        box-shadow:0 6px 22px rgba(30,25,70,.10); }
+.card .num { font-size:30px; font-weight:700; }
+.card .lbl { color:#6b7089; font-size:13px; margin-top:2px; }
+.ok { color:#169b57; } .bad { color:#d83a52; } .muted{color:#8a8fa8;}
+.banner { border-radius:12px; padding:14px 18px; margin-bottom:22px; font-weight:600; }
+.banner.pass { background:#e2f7ec; color:#0f7a43; }
+.banner.fail { background:#fde7eb; color:#b3233b; }
+table { width:100%; border-collapse:collapse; background:#fff; border-radius:12px; overflow:hidden;
+       box-shadow:0 2px 12px rgba(30,25,70,.07); }
+th, td { text-align:left; padding:10px 14px; font-size:13.5px; border-bottom:1px solid #eef0f7; }
+th { background:#fafbff; color:#5a607a; font-weight:600; }
+td.r { text-align:right; font-variant-numeric:tabular-nums; }
+h2 { font-size:18px; margin:34px 0 12px; }
+pre { background:#17182b; color:#e8e9f5; padding:16px 18px; border-radius:12px;
+      font-size:12.5px; line-height:1.55; overflow-x:auto; white-space:pre-wrap; }
+.pill { display:inline-block; padding:2px 10px; border-radius:99px; font-size:12px; font-weight:600; }
+.pill.ok { background:#e2f7ec; } .pill.bad { background:#fde7eb; }
+footer { color:#8a8fa8; font-size:12px; margin-top:40px; text-align:center; }
+</style></head>
+<body>
+<div class="hero"><h1>Nebula 全量测试报告</h1>
+<div class="meta">平台: windows-x64 (MSVC) local &nbsp;|&nbsp; Rust: rustc 1.98.1 (48a229cea 2026-09-01)<br>生成时间: 2026-09-24 15:48 UTC</div></div>
+<div class="wrap">
+<div class="cards">
+  <div class="card"><div class="num ok">PASS</div><div class="lbl">总体结论</div></div>
+  <div class="card"><div class="num ok">146</div><div class="lbl">通过</div></div>
+  <div class="card"><div class="num bad">0</div><div class="lbl">失败</div></div>
+  <div class="card"><div class="num muted">0</div><div class="lbl">忽略</div></div>
+  <div class="card"><div class="num muted">0</div><div class="lbl">过滤</div></div>
+</div>
+<div class="banner pass">✓ 全部测试通过</div>
+<table><thead><tr><th>测试目标</th><th>状态</th><th class="r">通过</th><th class="r">失败</th>
+<th class="r">忽略</th><th class="r">度量</th><th class="r">过滤</th><th class="r">耗时(s)</th></tr></thead>
+<tbody><tr><td>unittests src\main.rs<div class='muted' style='font-size:11px;margin-top:2px'>target\debug\deps\nebula-fdab302aa2c3c54a.exe</div></td><td><span class="pill ok">ok</span></td><td class='r'>4</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>-</td></tr><tr><td>unittests src\lib.rs<div class='muted' style='font-size:11px;margin-top:2px'>target\debug\deps\nebula_cluster-651e2b9e9b1d0dde.exe</div></td><td><span class="pill ok">ok</span></td><td class='r'>6</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>-</td></tr><tr><td>unittests src\lib.rs<div class='muted' style='font-size:11px;margin-top:2px'>target\debug\deps\nebula_config-cc897a76c320548f.exe</div></td><td><span class="pill ok">ok</span></td><td class='r'>13</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>-</td></tr><tr><td>unittests src\lib.rs<div class='muted' style='font-size:11px;margin-top:2px'>target\debug\deps\nebula_core-b00511bec531acb7.exe</div></td><td><span class="pill ok">ok</span></td><td class='r'>10</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>-</td></tr><tr><td>unittests src\lib.rs<div class='muted' style='font-size:11px;margin-top:2px'>target\debug\deps\nebula_crypto-cc2d639ac434d8d1.exe</div></td><td><span class="pill ok">ok</span></td><td class='r'>6</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>-</td></tr><tr><td>unittests src\lib.rs<div class='muted' style='font-size:11px;margin-top:2px'>target\debug\deps\nebula_engine-06597ad23c5414cc.exe</div></td><td><span class="pill ok">ok</span></td><td class='r'>46</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>-</td></tr><tr><td>tests\database.rs<div class='muted' style='font-size:11px;margin-top:2px'>target\debug\deps\database-b9656befd3fe7d41.exe</div></td><td><span class="pill ok">ok</span></td><td class='r'>4</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>-</td></tr><tr><td>unittests src\lib.rs<div class='muted' style='font-size:11px;margin-top:2px'>target\debug\deps\nebula_server-8115039c59b8ef80.exe</div></td><td><span class="pill ok">ok</span></td><td class='r'>12</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>-</td></tr><tr><td>tests\e2e.rs<div class='muted' style='font-size:11px;margin-top:2px'>target\debug\deps\e2e-3593b77ac544ef9c.exe</div></td><td><span class="pill ok">ok</span></td><td class='r'>5</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>-</td></tr><tr><td>unittests src\lib.rs<div class='muted' style='font-size:11px;margin-top:2px'>target\debug\deps\nebula_sql-7b2eae892c37c597.exe</div></td><td><span class="pill ok">ok</span></td><td class='r'>24</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>-</td></tr><tr><td>unittests src\lib.rs<div class='muted' style='font-size:11px;margin-top:2px'>target\debug\deps\nebula_storage-4e8c01d969a26f5c.exe</div></td><td><span class="pill ok">ok</span></td><td class='r'>3</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>-</td></tr><tr><td>tests\memory_file.rs<div class='muted' style='font-size:11px;margin-top:2px'>target\debug\deps\memory_file-eb17549558606e7a.exe</div></td><td><span class="pill ok">ok</span></td><td class='r'>4</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>-</td></tr><tr><td>unittests src\lib.rs<div class='muted' style='font-size:11px;margin-top:2px'>target\debug\deps\nebula_tokenizer-3f92185736605d55.exe</div></td><td><span class="pill ok">ok</span></td><td class='r'>9</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>-</td></tr><tr><td>doc-tests: nebula_cluster<div class='muted' style='font-size:11px;margin-top:2px'></div></td><td><span class="pill ok">ok</span></td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>-</td></tr><tr><td>doc-tests: nebula_config<div class='muted' style='font-size:11px;margin-top:2px'></div></td><td><span class="pill ok">ok</span></td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>-</td></tr><tr><td>doc-tests: nebula_core<div class='muted' style='font-size:11px;margin-top:2px'></div></td><td><span class="pill ok">ok</span></td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>-</td></tr><tr><td>doc-tests: nebula_crypto<div class='muted' style='font-size:11px;margin-top:2px'></div></td><td><span class="pill ok">ok</span></td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>-</td></tr><tr><td>doc-tests: nebula_engine<div class='muted' style='font-size:11px;margin-top:2px'></div></td><td><span class="pill ok">ok</span></td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>-</td></tr><tr><td>doc-tests: nebula_server<div class='muted' style='font-size:11px;margin-top:2px'></div></td><td><span class="pill ok">ok</span></td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>-</td></tr><tr><td>doc-tests: nebula_sql<div class='muted' style='font-size:11px;margin-top:2px'></div></td><td><span class="pill ok">ok</span></td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>-</td></tr><tr><td>doc-tests: nebula_storage<div class='muted' style='font-size:11px;margin-top:2px'></div></td><td><span class="pill ok">ok</span></td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>-</td></tr><tr><td>doc-tests: nebula_tokenizer<div class='muted' style='font-size:11px;margin-top:2px'></div></td><td><span class="pill ok">ok</span></td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>0</td><td class='r'>-</td></tr></tbody></table>
+
+<footer>Nebula · 本地优先的个人记忆检索引擎 · 报告由 scripts/make_test_report.py 自动生成</footer>
+</div></body></html>

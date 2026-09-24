@@ -1,0 +1,125 @@
+name: Release
+
+# push tag (形如 v0.1.0-ES) 触发:四目标构建 → 打包 → 创建 GitHub Release。
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: package ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+    matrix:
+      include:
+        - os: windows-latest
+          target: x86_64-pc-windows-msvc
+          bin: nebula.exe
+          ext: zip
+        - os: ubuntu-latest
+          target: x86_64-unknown-linux-gnu
+          bin: nebula
+          ext: tar.gz
+        - os: macos-13
+          target: x86_64-apple-darwin
+          bin: nebula
+          ext: tar.gz
+        - os: macos-14
+          target: aarch64-apple-darwin
+          bin: nebula
+          ext: tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage package (unix)
+        if: matrix.ext == 'tar.gz'
+        shell: bash
+        run: |
+          PKG="nebula-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$PKG"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/$PKG/"
+          cp README.md LICENSE "dist/$PKG/"
+          cp assets/icon.png assets/nebula.ico "dist/$PKG/"
+          cd dist
+          tar -czf "$PKG.tar.gz" "$PKG"
+          sha256sum "$PKG.tar.gz" | tee "$PKG.tar.gz.sha256"
+
+      - name: Stage package (windows)
+        if: matrix.ext == 'zip'
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $pkg = "nebula-$tag-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force "dist/$pkg" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/$pkg/"
+          Copy-Item README.md, LICENSE, assets/icon.png, assets/nebula.ico "dist/$pkg/"
+          Compress-Archive -Path "dist/$pkg" -DestinationPath "dist/$pkg.zip"
+          $hash = (Get-FileHash "dist/$pkg.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $pkg.zip" | Set-Content "dist/$pkg.zip.sha256" -NoNewline
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+
+  publish:
+    name: publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List assets
+        run: ls -la dist
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          # ES = Engineering Sample:标记为工程测试预发布版。
+          prerelease: true
+          name: ${{ github.ref_name }} · 工程测试版 (Engineering Sample)
+          body: |
+            ## Nebula ${{ github.ref_name }} — 工程测试版 (ES)
+
+            本地优先的个人记忆检索引擎首个工程测试版本。
+
+            ### 安装
+            1. 根据平台下载下方对应资产并解压;
+            2. 校验(可选): `sha256sum -c <文件>.sha256`;
+            3. 将 `nebula` 放入 PATH,执行 `nebula create` 即可开始。
+
+            详见仓库 README(安装 / SQL 用法 / 服务请求格式)。
+
+            ### 本版要点
+            - 单文件加密存储 + 多库分库 + 目录集群
+            - BM25 检索 / 联想 / 关键词标签过滤
+            - 用户与按库授权 (READ/WRITE/ADMIN)
+            - SQL 事务 BEGIN / COMMIT / ROLLBACK
+            - 分级诊断日志与按大小滚动
+            - Windows 可执行文件已嵌入应用图标
+
+            > ES 为工程测试版,数据格式与接口可能继续演进。
+          files: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256

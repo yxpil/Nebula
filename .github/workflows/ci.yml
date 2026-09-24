@@ -1,0 +1,70 @@
+name: CI
+
+# 全平台构建+全量测试,每个平台产出 HTML 测试报告(artifact)。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows-x64 (MSVC)
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - label: linux-x64 (GNU)
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - label: macos-x64 (Intel)
+            os: macos-13
+            target: x86_64-apple-darwin
+          - label: macos-arm64 (Apple Silicon)
+            os: macos-14
+            target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build workspace (all targets)
+        run: cargo build --workspace --all-targets --locked --target ${{ matrix.target }}
+
+      - name: Run full test suite
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p reports
+          cargo test --workspace --locked --no-fail-fast --target ${{ matrix.target }} 2>&1 \
+            | tee reports/cargo-test.log
+
+      - name: Generate HTML report page
+        if: always()
+        shell: bash
+        run: |
+          export REPORT_LABEL="${{ matrix.label }}"
+          export REPORT_RUSTC="$(rustc --version)"
+          python3 scripts/make_test_report.py reports/test-report.html < reports/cargo-test.log || true
+          cp reports/cargo-test.log "reports/cargo-test-${{ matrix.target }}.log"
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report-${{ matrix.target }}
+          path: reports/
+          if-no-files-found: error
