@@ -1,0 +1,14 @@
+[package]
+name = "nebula-cluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Nebula: directory cluster - multi-file databases, users and per-db grants"
+
+[dependencies]
+nebula-core = { path = "../nebula-core" }
+nebula-crypto = { path = "../nebula-crypto" }
+nebula-storage = { path = "../nebula-storage" }
+nebula-tokenizer = { path = "../nebula-tokenizer" }
+nebula-sql = { path = "../nebula-sql" }
+nebula-engine = { path = "../nebula-engine" }

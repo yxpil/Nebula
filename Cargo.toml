@@ -8,6 +8,7 @@ members = [
     "crates/nebula-sql",
     "crates/nebula-engine",
     "crates/nebula-config",
+    "crates/nebula-cluster",
     "crates/nebula-server",
     "crates/nebula-cli",
 ]
