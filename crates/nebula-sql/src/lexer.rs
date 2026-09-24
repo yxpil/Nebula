@@ -19,6 +19,8 @@ pub enum Token {
     Ge,
     Star,
     Comma,
+    /// 点号(限定名 db.id 等)。
+    Dot,
     LParen,
     RParen,
     Percent,
@@ -134,6 +136,10 @@ impl<'a> Lexer<'a> {
                 self.bump();
                 Ok(Token::Star)
             }
+            b'.' => {
+                self.bump();
+                Ok(Token::Dot)
+            }
             b',' => {
                 self.bump();
                 Ok(Token::Comma)
@@ -207,8 +213,14 @@ impl<'a> Lexer<'a> {
             if c.is_ascii_digit() {
                 self.pos += 1;
             } else if c == b'.' && !is_float {
-                is_float = true;
-                self.pos += 1;
+                // 只有小数点后紧跟数字才是浮点;否则点号留给 Dot token
+                // (支持 RELATED TO db.id 这类限定名)。
+                if self.src.get(self.pos + 1).is_some_and(u8::is_ascii_digit) {
+                    is_float = true;
+                    self.pos += 1;
+                } else {
+                    break;
+                }
             } else {
                 break;
             }
