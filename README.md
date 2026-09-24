@@ -53,8 +53,10 @@ tar -xzf nebula-*.tar.gz
 cd nebula-*/
 ./nebula --help
 
-# 可选:校验完整性
+# 可选:校验完整性 (Linux)
 sha256sum -c nebula-*.tar.gz.sha256
+# macOS 无 sha256sum,用:
+shasum -a 256 -c nebula-*.tar.gz.sha256
 
 # Windows (PowerShell)
 Expand-Archive .\nebula-*.zip

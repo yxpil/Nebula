@@ -60,7 +60,12 @@ jobs:
           cp assets/icon.png assets/nebula.ico "dist/$PKG/"
           cd dist
           tar -czf "$PKG.tar.gz" "$PKG"
-          sha256sum "$PKG.tar.gz" | tee "$PKG.tar.gz.sha256"
+          # macOS 没有 sha256sum,改用 shasum;两者输出格式一致
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$PKG.tar.gz" | tee "$PKG.tar.gz.sha256"
+          else
+            shasum -a 256 "$PKG.tar.gz" | tee "$PKG.tar.gz.sha256"
+          fi
 
       - name: Build NSIS setup (windows)
         if: matrix.ext == 'zip'
@@ -75,6 +80,7 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" "installer/stage/"
           Copy-Item README.md, LICENSE, assets/icon.png "installer/stage/"
           $ver = $env:GITHUB_REF_NAME -replace '^v', ''
+          New-Item -ItemType Directory -Force "dist" | Out-Null
           & "C:\Program Files (x86)\NSIS\makensis.exe" /V2 "/DVERSION=$ver" installer/nebula.nsi
           $setup = Get-Item "dist/nebula-setup-$ver.exe"
           if (-not $setup) { throw "NSIS setup was not produced" }
