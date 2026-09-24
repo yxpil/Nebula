@@ -14,6 +14,10 @@ nebula-config = { path = "../nebula-config" }
 nebula-server = { path = "../nebula-server" }
 rpassword = "7"
 
+# Windows 资源(图标/版本信息)编译;仅 Windows 目标需要。
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
 [[bin]]
 name = "nebula"
 path = "src/main.rs"
