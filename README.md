@@ -36,7 +36,9 @@ Nebula 是一个**完全本地运行**的个人记忆 / 笔记检索引擎:所�
 
 ### 方式一:下载预编译版本(推荐)
 
-前往 [Releases 页面](https://github.com/yxpil/Nebula/releases),按平台选择资产:
+**Windows 安装版**:从 [Releases](https://github.com/yxpil/Nebula/releases) 下载 `nebula-setup-*.exe` 运行即可——可自定义安装目录与开始菜单文件夹、创建卸载项(写入"添加/删除程序"),安装在用户目录,**无需管理员权限**;卸载时完整清理程序文件,你的 `.ndb` 数据不受影响。
+
+需要免安装/U盘携带时使用 zip 便携版;macOS、Linux 使用 tar.gz:
 
 | 平台 | 资产文件名包含 |
 | --- | --- |

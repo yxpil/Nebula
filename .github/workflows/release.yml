@@ -60,6 +60,24 @@ jobs:
           tar -czf "$PKG.tar.gz" "$PKG"
           sha256sum "$PKG.tar.gz" | tee "$PKG.tar.gz.sha256"
 
+      - name: Build NSIS setup (windows)
+        if: matrix.ext == 'zip'
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          # GitHub Windows 运行器预装 NSIS;缺失则用 choco 补装
+          if (-not (Test-Path "C:\Program Files (x86)\NSIS\makensis.exe")) {
+            choco install nsis -y --no-progress
+          }
+          New-Item -ItemType Directory -Force "installer/stage" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" "installer/stage/"
+          Copy-Item README.md, LICENSE, assets/icon.png "installer/stage/"
+          & "C:\Program Files (x86)\NSIS\makensis.exe" /V2 "/DVERSION=$tag" installer/nebula.nsi
+          $setup = Get-Item "dist/nebula-setup-$tag.exe"
+          if (-not $setup) { throw "NSIS setup was not produced" }
+          $hash = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
+          "$hash  $($setup.Name)" | Set-Content "$($setup.FullName).sha256" -NoNewline
+
       - name: Stage package (windows)
         if: matrix.ext == 'zip'
         shell: pwsh
@@ -104,9 +122,10 @@ jobs:
             本地优先的个人记忆检索引擎首个工程测试版本。
 
             ### 安装
-            1. 根据平台下载下方对应资产并解压;
-            2. 校验(可选): `sha256sum -c <文件>.sha256`;
-            3. 将 `nebula` 放入 PATH,执行 `nebula create` 即可开始。
+            - **Windows**:下载 `nebula-setup-*.exe` 直接运行安装(可选安装目录/开始菜单/卸载,
+              无需管理员权限);也可使用 zip 便携版;
+            - **macOS / Linux**:下载对应 tar.gz 解压,可选 `sha256sum -c <文件>.sha256` 校验;
+            - 将 `nebula` 放入 PATH,执行 `nebula create` 即可开始。
 
             详见仓库 README(安装 / SQL 用法 / 服务请求格式)。
 
