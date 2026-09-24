@@ -148,10 +148,10 @@ impl Database {
         if content.trim().is_empty() {
             return Err(nebula_core::Error::Sql("content must not be empty".into()));
         }
-        if content.chars().count() > nebula_core::MAX_CONTENT_LEN {
+        if content.chars().count() > self.cfg.max_content_len {
             return Err(nebula_core::Error::Sql(format!(
                 "content exceeds limit of {} chars",
-                nebula_core::MAX_CONTENT_LEN
+                self.cfg.max_content_len
             )));
         }
 
@@ -233,9 +233,11 @@ impl Database {
             records.truncate(limit);
         }
 
+        // 展示截断上限取自提取配置(每条记忆实际提取多少就展示多少)。
+        let ex_cfg = self.extractor.config().clone();
         let rows = records
             .iter()
-            .map(|r| project_row(r, &columns))
+            .map(|r| project_row(r, &columns, &ex_cfg))
             .collect();
 
         Ok(QueryResult {
@@ -414,16 +416,20 @@ fn eval_record(expr: &Expr, rec: &MemoryRecord) -> bool {
     }
 }
 
-/// 按列清单投影一行。
-fn project_row(rec: &MemoryRecord, columns: &[String]) -> Vec<String> {
+/// 按列清单投影一行(关键词/关键点列按提取配置上限截断展示)。
+fn project_row(
+    rec: &MemoryRecord,
+    columns: &[String],
+    ex_cfg: &nebula_tokenizer::ExtractorConfig,
+) -> Vec<String> {
     columns
         .iter()
         .map(|col| match col.as_str() {
             "id" => rec.id.to_string(),
             "content" => rec.content.clone(),
-            "key_points" => fmt_key_points(&rec.key_points),
-            "keywords" => fmt_keywords(&rec.keywords),
-            "keywords_inline" => keywords_inline(&rec.keywords),
+            "key_points" => fmt_key_points(&rec.key_points, ex_cfg.max_key_points),
+            "keywords" => fmt_keywords(&rec.keywords, ex_cfg.max_keywords),
+            "keywords_inline" => keywords_inline(&rec.keywords, ex_cfg.max_keywords),
             "tags" => fmt_tags(&rec.tags),
             "source" => rec.source.clone(),
             "importance" => fmt_importance(rec.importance),

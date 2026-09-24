@@ -8,6 +8,7 @@ description = "Nebula: command line client (local mode and remote mode)"
 [dependencies]
 nebula-core = { path = "../nebula-core" }
 nebula-engine = { path = "../nebula-engine" }
+nebula-config = { path = "../nebula-config" }
 nebula-server = { path = "../nebula-server" }
 rpassword = "7"
 

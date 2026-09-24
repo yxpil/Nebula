@@ -6,16 +6,19 @@
 //! - 关键点 = 句子级抽取式打分(关键词覆盖度 + 位置权重 + 长度惩罚 + 相似句去重)。
 
 use nebula_core::Keyword;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub mod stopwords;
+
+pub use stopwords::{default_stopword_set, load_stopwords_file, DEFAULT_STOPWORDS};
 
 use crate::stopwords::{is_cjk, is_noise, is_stopword};
 
 use jieba_rs::Jieba;
 
-/// 提取行为配置。
-#[derive(Debug, Clone)]
+/// 提取行为配置(全部字段可在配置文件中调整)。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ExtractorConfig {
     /// 每条记忆最多保留的关键词数。
     pub max_keywords: usize,
@@ -38,22 +41,32 @@ impl Default for ExtractorConfig {
     }
 }
 
-/// 分词与关键信息提取器。内部持有 jieba 实例(词典启动加载一次)。
+/// 分词与关键信息提取器。内部持有 jieba 实例(词典启动加载一次)
+/// 与运行时停用词集合(来自库旁配置目录的 stopwords.txt)。
 pub struct TextExtractor {
     jieba: Jieba,
     config: ExtractorConfig,
+    stopwords: HashSet<String>,
 }
 
 impl TextExtractor {
-    pub fn new(config: ExtractorConfig) -> Self {
+    /// 使用给定提取配置与停用词集合构造。
+    pub fn new(config: ExtractorConfig, stopwords: HashSet<String>) -> Self {
         TextExtractor {
             jieba: Jieba::new(),
             config,
+            stopwords,
         }
     }
 
+    /// 默认配置 + 内置默认停用词表(单元测试用)。
     pub fn with_default_config() -> Self {
-        Self::new(ExtractorConfig::default())
+        Self::new(ExtractorConfig::default(), default_stopword_set())
+    }
+
+    /// 提取配置(读取上限用于展示截断)。
+    pub fn config(&self) -> &ExtractorConfig {
+        &self.config
     }
 
     /// 原始分词:英文统一小写,不过滤停用词/噪声(供搜索引擎式场景使用)。
@@ -70,7 +83,7 @@ impl TextExtractor {
         let min_len = self.config.min_keyword_len;
         self.tokenize_raw(text)
             .into_iter()
-            .filter(|t| char_len(t) >= min_len && !is_noise(t) && !is_stopword(t))
+            .filter(|t| char_len(t) >= min_len && !is_noise(t) && !is_stopword(t, &self.stopwords))
             .collect()
     }
 
@@ -326,5 +339,34 @@ mod tests {
     fn split_sentences_keeps_quotes() {
         let s = split_sentences("他说:\"今天天气不错。\" 然后离开了。下一句");
         assert_eq!(s, vec!["他说:\"今天天气不错。\"", "然后离开了。", "下一句"]);
+    }
+
+    #[test]
+    fn custom_stopword_set_overrides_default() {
+        // 空停用词表时,默认停用词(如 "的")不再被过滤的语义由调用方保证;
+        // 这里验证自定义集合能拦下原本不在默认表里的词。
+        let cfg = ExtractorConfig {
+            min_keyword_len: 1,
+            ..ExtractorConfig::default()
+        };
+        let mut custom = default_stopword_set();
+        custom.insert("rust".to_string());
+        let e = TextExtractor::new(cfg, custom);
+        let tokens = e.tokenize("rust 所有权");
+        assert!(!tokens.contains(&"rust".to_string()));
+        assert!(tokens.contains(&"所有权".to_string()));
+    }
+
+    #[test]
+    fn stopwords_file_roundtrip() {
+        use crate::stopwords::load_stopwords_file;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("nebula_stop_{}.txt", std::process::id()));
+        std::fs::write(&path, "# 注释\nrust\n\n  内存  \n").unwrap();
+        let set = load_stopwords_file(&path).unwrap();
+        assert!(set.contains("rust"));
+        assert!(set.contains("内存"));
+        assert_eq!(set.len(), 2);
+        let _ = std::fs::remove_file(&path);
     }
 }

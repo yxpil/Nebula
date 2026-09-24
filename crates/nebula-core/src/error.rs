@@ -12,6 +12,7 @@ pub enum Error {
     Sql(String),
     Auth(String),
     Protocol(String),
+    Config(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -27,6 +28,7 @@ impl fmt::Display for Error {
             Error::Sql(s) => write!(f, "sql error: {s}"),
             Error::Auth(s) => write!(f, "auth error: {s}"),
             Error::Protocol(s) => write!(f, "protocol error: {s}"),
+            Error::Config(s) => write!(f, "config error: {s}"),
         }
     }
 }

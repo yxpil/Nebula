@@ -6,34 +6,55 @@
 //! 3. 之后所有语句经 [`crate::executor`] 执行
 //!
 //! 持久化策略:
-//! - INSERT 批量落索引,达到 [`AUTO_CHECKPOINT`] 或显式 CHECKPOINT 时写快照
+//! - INSERT 批量落索引,达到 `cfg.auto_checkpoint` 或显式 CHECKPOINT 时写快照
 //! - DELETE / UPDATE 立即写快照(索引条目即时变化,防止重开后复活)
 //! - 关闭时自动 CHECKPOINT,然后 fsync
+//!
+//! 所有行为参数(检查点阈值、内容/关键词/关键点上限、分词与停用词)
+//! 通过 [`crate::EngineConfig`] 与停用词集合注入,本 crate 不读取配置文件。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use nebula_core::{codec, MemoryId, MemoryRecord, Result};
 #[cfg(test)]
 use nebula_core::RecordLocation;
-use nebula_tokenizer::TextExtractor;
+use nebula_tokenizer::{default_stopword_set, ExtractorConfig, TextExtractor};
 
 use nebula_storage::MemoryFile;
 
+use crate::config::EngineConfig;
 use crate::index::MemoryIndex;
-
-/// 累计多少条 INSERT 后自动写索引快照。
-pub const AUTO_CHECKPOINT: u64 = 1000;
 
 pub struct Database {
     path: PathBuf,
     pub(crate) file: MemoryFile,
     pub(crate) index: MemoryIndex,
     pub(crate) extractor: TextExtractor,
+    pub(crate) cfg: EngineConfig,
 }
 
 impl Database {
-    /// 打开已存在的记忆库。密码错误返回 [`Error::wrong_password`](nebula_core::Error::wrong_password)。
+    /// 打开已存在的记忆库(使用引擎默认配置与内置停用词表)。
+    /// 密码错误返回 [`Error::wrong_password`](nebula_core::Error::wrong_password)。
     pub fn open(path: impl AsRef<Path>, password: &str) -> Result<Self> {
+        Self::open_configured(
+            path,
+            password,
+            &EngineConfig::default(),
+            &ExtractorConfig::default(),
+            &default_stopword_set(),
+        )
+    }
+
+    /// 打开已存在的记忆库,注入引擎配置、提取配置与停用词表。
+    pub fn open_configured(
+        path: impl AsRef<Path>,
+        password: &str,
+        cfg: &EngineConfig,
+        extractor_cfg: &ExtractorConfig,
+        stopwords: &HashSet<String>,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let mut file = MemoryFile::open(&path, password)?;
         let snap = file.read_index_snapshot()?;
@@ -42,19 +63,40 @@ impl Database {
             path,
             file,
             index,
-            extractor: TextExtractor::with_default_config(),
+            extractor: TextExtractor::new(extractor_cfg.clone(), stopwords.clone()),
+            cfg: cfg.clone(),
         })
     }
 
-    /// 创建新记忆库(文件必须不存在)。
+    /// 创建新记忆库(文件必须不存在;使用引擎默认配置与内置停用词表)。
     pub fn create(path: impl AsRef<Path>, password: &str, page_size: u32) -> Result<Self> {
+        Self::create_configured(
+            path,
+            password,
+            page_size,
+            &EngineConfig::default(),
+            &ExtractorConfig::default(),
+            &default_stopword_set(),
+        )
+    }
+
+    /// 创建新记忆库,注入引擎配置、提取配置与停用词表。
+    pub fn create_configured(
+        path: impl AsRef<Path>,
+        password: &str,
+        page_size: u32,
+        cfg: &EngineConfig,
+        extractor_cfg: &ExtractorConfig,
+        stopwords: &HashSet<String>,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = MemoryFile::create(&path, password, page_size)?;
         Ok(Database {
             path,
             file,
             index: MemoryIndex::new(),
-            extractor: TextExtractor::with_default_config(),
+            extractor: TextExtractor::new(extractor_cfg.clone(), stopwords.clone()),
+            cfg: cfg.clone(),
         })
     }
 
@@ -64,6 +106,11 @@ impl Database {
 
     pub fn memory_count(&self) -> usize {
         self.index.len()
+    }
+
+    /// 当前提取配置(展示截断等场景读取上限)。
+    pub fn extractor_config(&self) -> &nebula_tokenizer::ExtractorConfig {
+        self.extractor.config()
     }
 
     // ------- 供 executor 使用的内部 API -------
@@ -94,7 +141,7 @@ impl Database {
         self.file.set_memory_count(self.index.len() as u64);
         self.file.commit_catalog()?;
 
-        if self.file.dirty_records() >= AUTO_CHECKPOINT {
+        if self.file.dirty_records() >= self.cfg.auto_checkpoint {
             self.checkpoint()?;
         }
         Ok(record.id)

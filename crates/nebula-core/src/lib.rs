@@ -10,7 +10,4 @@ pub mod error;
 pub mod types;
 
 pub use error::{Error, Result};
-pub use types::{
-    Keyword, MemoryId, MemoryRecord, RecordLocation, Timestamp, DEFAULT_PAGE_SIZE, FORMAT_VERSION,
-    MAX_CONTENT_LEN, MAX_KEY_POINTS, MAX_KEYWORDS,
-};
+pub use types::{Keyword, MemoryId, MemoryRecord, RecordLocation, Timestamp, FORMAT_VERSION};

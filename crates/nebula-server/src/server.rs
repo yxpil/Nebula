@@ -4,6 +4,7 @@
 //! 客户端每次连接用挑战应答证明自己知道密码,无需传递密码本身。
 //! 所有连接共享同一个 [`Database`](nebula_engine::Database)(Mutex 串行化)。
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -15,8 +16,9 @@ use std::time::Duration;
 
 use nebula_core::Result;
 use nebula_crypto::{ct_eq, derive_master_key, random_bytes, SALT_LEN};
-use nebula_engine::Database;
+use nebula_engine::{Database, EngineConfig};
 use nebula_storage::page::{HEADER_PREFIX_LEN, MAGIC, SALT_OFFSET};
+use nebula_tokenizer::ExtractorConfig;
 
 use crate::protocol::{
     auth_proof, read_frame, session_key, write_frame, CHALLENGE_LEN, Direction, HELLO_LEN,
@@ -34,7 +36,26 @@ pub struct Server {
 impl Server {
     /// 打开已有数据库并准备服务(密码错误即失败)。
     pub fn open(addr: SocketAddr, path: &Path, password: &str) -> Result<Self> {
-        let db = Database::open(path, password)?;
+        Self::open_configured(
+            addr,
+            path,
+            password,
+            &EngineConfig::default(),
+            &ExtractorConfig::default(),
+            &nebula_tokenizer::default_stopword_set(),
+        )
+    }
+
+    /// 打开已有数据库并准备服务,注入引擎/提取配置与停用词(库旁配置)。
+    pub fn open_configured(
+        addr: SocketAddr,
+        path: &Path,
+        password: &str,
+        cfg: &EngineConfig,
+        extractor_cfg: &ExtractorConfig,
+        stopwords: &HashSet<String>,
+    ) -> Result<Self> {
+        let db = Database::open_configured(path, password, cfg, extractor_cfg, stopwords)?;
         let salt = load_salt(path)?;
         let master_key = derive_master_key(password, &salt);
         Ok(Server {
@@ -47,7 +68,28 @@ impl Server {
 
     /// 创建新数据库并准备服务(文件必须不存在)。
     pub fn create(addr: SocketAddr, path: &Path, password: &str, page_size: u32) -> Result<Self> {
-        let db = Database::create(path, password, page_size)?;
+        Self::create_configured(
+            addr,
+            path,
+            password,
+            page_size,
+            &EngineConfig::default(),
+            &ExtractorConfig::default(),
+            &nebula_tokenizer::default_stopword_set(),
+        )
+    }
+
+    /// 创建新数据库并准备服务,注入引擎/提取配置与停用词(库旁配置)。
+    pub fn create_configured(
+        addr: SocketAddr,
+        path: &Path,
+        password: &str,
+        page_size: u32,
+        cfg: &EngineConfig,
+        extractor_cfg: &ExtractorConfig,
+        stopwords: &HashSet<String>,
+    ) -> Result<Self> {
+        let db = Database::create_configured(path, password, page_size, cfg, extractor_cfg, stopwords)?;
         let salt = load_salt(path)?;
         let master_key = derive_master_key(password, &salt);
         Ok(Server {

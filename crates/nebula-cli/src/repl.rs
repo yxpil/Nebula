@@ -1,20 +1,20 @@
 //! 交互式 REPL:本地模式(直连引擎)与远程模式(走 TCP 客户端)共用一套命令集。
+//!
+//! 提示符、表格宽度、行数上限等展示参数全部来自库旁配置([`LoadedConfig`])。
 
 use std::io::{BufRead, Write};
 
+use nebula_config::LoadedConfig;
 use nebula_core::Result;
 use nebula_engine::Database;
 use nebula_server::{Client, Response};
 
 use crate::render::print_table;
 
-/// 提示符。
-const PROMPT: &str = "nebula> ";
-
 /// REPL 的帮助文本。
 const HELP: &str = "\
 可用命令:
-  <SQL>           执行一条 SQL(INSERT/SELECT/DELETE/UPDATE/CHECKPOINT/SHOW ...)
+  <SQL>           执行一条 SQL(INSERT/SELECT/DELETE/UPDATE/CHECKPOINT/SHOW ...;可用分号分隔多条)
   help            显示本帮助
   exit | quit     退出(本地模式会自动 CHECKPOINT)
 示例:
@@ -23,16 +23,18 @@ const HELP: &str = "\
   SELECT * FROM memories WHERE content LIKE '%关键词%' ORDER BY id LIMIT 10;";
 
 /// 本地模式:直接驱动 [`Database`]。
-pub fn run_local(mut db: Database) -> Result<()> {
+pub fn run_local(mut db: Database, cfg: &LoadedConfig) -> Result<()> {
     println!(
         "connected to {} ({} memories). 输入 help 查看用法, exit 退出。",
         db.path().display(),
         db.memory_count()
     );
+    let prompt = cfg.config.cli.prompt.clone();
+    let (cell_max, max_rows) = (cfg.config.cli.cell_max, cfg.config.cli.max_rows);
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
     loop {
-        print!("{PROMPT}");
+        print!("{prompt}");
         flush_stdout();
         let Some(line) = read_line(&mut lines) else {
             break; // EOF(Ctrl+C / Ctrl+Z / 管道关闭)
@@ -53,7 +55,7 @@ pub fn run_local(mut db: Database) -> Result<()> {
         match db.execute_script(sql) {
             Ok(results) => {
                 for r in &results {
-                    print_result(&r.columns, &r.rows, &r.message, r.affected);
+                    print_result(&r.columns, &r.rows, &r.message, r.affected, cell_max, max_rows);
                 }
             }
             Err(e) => eprintln!("error: {e}"),
@@ -66,15 +68,17 @@ pub fn run_local(mut db: Database) -> Result<()> {
 }
 
 /// 远程模式:通过 [`Client`] 走加密 TCP 会话。
-pub fn run_remote(mut client: Client) -> Result<()> {
+pub fn run_remote(mut client: Client, cfg: &LoadedConfig) -> Result<()> {
     println!(
         "connected to {}. 输入 help 查看用法, exit 断开。",
         client.peer_addr()
     );
+    let prompt = cfg.config.cli.prompt.clone();
+    let (cell_max, max_rows) = (cfg.config.cli.cell_max, cfg.config.cli.max_rows);
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
     loop {
-        print!("{PROMPT}");
+        print!("{prompt}");
         flush_stdout();
         let Some(line) = read_line(&mut lines) else {
             break;
@@ -97,10 +101,10 @@ pub fn run_remote(mut client: Client) -> Result<()> {
                 // 单语句时直接渲染主结果。
                 if let Some(list) = &resp.script {
                     for sub in list {
-                        print_response(sub);
+                        print_response(sub, cell_max, max_rows);
                     }
                 } else {
-                    print_response(&resp);
+                    print_response(&resp, cell_max, max_rows);
                 }
             }
             Ok(resp) => {
@@ -134,7 +138,14 @@ fn flush_stdout() {
     let _ = std::io::stdout().flush();
 }
 
-fn print_result(columns: &[String], rows: &[Vec<String>], message: &str, affected: u64) {
+fn print_result(
+    columns: &[String],
+    rows: &[Vec<String>],
+    message: &str,
+    affected: u64,
+    cell_max: usize,
+    max_rows: usize,
+) {
     if columns.is_empty() && rows.is_empty() {
         if !message.is_empty() {
             println!("{message}");
@@ -142,12 +153,12 @@ fn print_result(columns: &[String], rows: &[Vec<String>], message: &str, affecte
             println!("OK, affected {affected}");
         }
     } else {
-        print_table(columns, rows);
+        print_table(columns, rows, cell_max, max_rows);
     }
 }
 
 /// 渲染一条服务端响应(复用本地模式的打印逻辑)。
-fn print_response(r: &Response) {
+fn print_response(r: &Response, cell_max: usize, max_rows: usize) {
     let empty: Vec<String> = Vec::new();
     let empty_rows: Vec<Vec<String>> = Vec::new();
     print_result(
@@ -155,6 +166,8 @@ fn print_response(r: &Response) {
         r.rows.as_ref().unwrap_or(&empty_rows),
         r.message.as_deref().unwrap_or(""),
         r.affected,
+        cell_max,
+        max_rows,
     );
 }
 

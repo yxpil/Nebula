@@ -1,13 +1,14 @@
 [package]
-name = "nebula-engine"
+name = "nebula-config"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Nebula: database engine - records, inverted index, SQL execution, checkpointing"
+description = "Nebula: per-database config folder (TOML + stopwords file) loading and template generation"
 
 [dependencies]
 nebula-core = { path = "../nebula-core" }
+nebula-engine = { path = "../nebula-engine" }
 nebula-storage = { path = "../nebula-storage" }
 nebula-tokenizer = { path = "../nebula-tokenizer" }
-nebula-sql = { path = "../nebula-sql" }
 serde = { version = "1", features = ["derive"] }
+toml = "0.8"

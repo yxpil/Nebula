@@ -8,16 +8,8 @@ pub type MemoryId = u64;
 /// Unix 毫秒时间戳。
 pub type Timestamp = i64;
 
-/// 文件格式版本号。
+/// 文件格式版本号(格式结构变更时递增,与配置无关)。
 pub const FORMAT_VERSION: u16 = 1;
-/// 默认页大小(字节)。页大小在 4096..=65536 之间且必须是 2 的幂。
-pub const DEFAULT_PAGE_SIZE: u32 = 4096;
-/// 单条记忆内容上限(1 MiB)。
-pub const MAX_CONTENT_LEN: usize = 1 << 20;
-/// 单条记忆关键词上限。
-pub const MAX_KEYWORDS: usize = 64;
-/// 单条记忆关键点上限。
-pub const MAX_KEY_POINTS: usize = 32;
 
 /// 带权重的关键词。
 #[derive(Debug, Clone, PartialEq)]

@@ -1,7 +1,7 @@
 //! 结果集渲染辅助:时间戳格式化、关键词/关键点/标签的展示格式。
 //! Unix 毫秒 → UTC "YYYY-MM-DD HH:MM:SS"(不引入 chrono,算法见下文)。
 
-use nebula_core::{Keyword, MAX_KEY_POINTS, MAX_KEYWORDS};
+use nebula_core::Keyword;
 
 /// Unix 毫秒时间戳格式化为 UTC 日期时间。
 pub fn fmt_time(millis: nebula_core::Timestamp) -> String {
@@ -34,29 +34,29 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y + i64::from(m <= 2), m as u32, d as u32)
 }
 
-/// `rust(0.91), 内存(0.45)` 形式。
-pub fn fmt_keywords(kws: &[Keyword]) -> String {
+/// `rust(0.91), 内存(0.45)` 形式。`max` 为展示截断上限。
+pub fn fmt_keywords(kws: &[Keyword], max: usize) -> String {
     kws.iter()
-        .take(MAX_KEYWORDS)
+        .take(max)
         .map(|k| format!("{}({:.2})", k.term, k.weight))
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-/// `rust, 内存, 所有权` 纯词项形式。
-pub fn keywords_inline(kws: &[Keyword]) -> String {
+/// `rust, 内存, 所有权` 纯词项形式。`max` 为展示截断上限。
+pub fn keywords_inline(kws: &[Keyword], max: usize) -> String {
     kws.iter()
-        .take(MAX_KEYWORDS)
+        .take(max)
         .map(|k| k.term.clone())
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-/// 关键点多行展示(SELECT * 时用)。
-pub fn fmt_key_points(points: &[String]) -> String {
+/// 关键点多行展示(SELECT * 时用)。`max` 为展示截断上限。
+pub fn fmt_key_points(points: &[String], max: usize) -> String {
     points
         .iter()
-        .take(MAX_KEY_POINTS)
+        .take(max)
         .map(|p| format!("• {p}"))
         .collect::<Vec<_>>()
         .join("\n")
@@ -93,9 +93,13 @@ mod tests {
     #[test]
     fn keyword_and_point_formatting() {
         let kws = vec![Keyword::new("rust", 0.9123), Keyword::new("内存", 0.4)];
-        assert_eq!(fmt_keywords(&kws), "rust(0.91), 内存(0.40)");
-        assert_eq!(keywords_inline(&kws), "rust, 内存");
-        assert_eq!(fmt_key_points(&["一条".into(), "二条".into()]), "• 一条\n• 二条");
+        assert_eq!(fmt_keywords(&kws, 64), "rust(0.91), 内存(0.40)");
+        assert_eq!(keywords_inline(&kws, 64), "rust, 内存");
+        assert_eq!(fmt_key_points(&["一条".into(), "二条".into()], 32), "• 一条\n• 二条");
+        // 展示上限生效
+        assert_eq!(fmt_keywords(&kws, 1), "rust(0.91)");
+        assert_eq!(keywords_inline(&kws, 1), "rust");
+        assert_eq!(fmt_key_points(&["一条".into(), "二条".into()], 1), "• 一条");
         assert_eq!(fmt_tags(&["a".into(), "b".into()]), "a, b");
         assert_eq!(fmt_importance(0.5), "0.50");
         assert_eq!(fmt_time(-5), "-");
