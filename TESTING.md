@@ -1,3 +1,11 @@
+# Nebula 测试说明
+- 测试完成：是（2026-10-04）
+- 测试日期：2026-10-04
+- 测试内容：单元覆盖 nebula-core(codec/类型)、nebula-crypto(KDF/AEAD/HKDF)、nebula-sql(MySQL 子集词法/语法/AST)、nebula-tokenizer(中英分词/停用词)、nebula-storage(页/pager/记录)、nebula-engine(记录/倒排索引/执行器/缓存/事务/权限)、nebula-config、nebula-cluster(用户与授权)、nebula-server(挑战-响应协议)；集成覆盖 engine/database、server/e2e、storage/memory_file；注入测试集中于 nebula-sql（`''` 转义使布尔永真式留在字符串字面量、行/块注释被词法拒绝、堆叠危险语句与尾部 token 被拒、LIKE 内层通配符拒绝、id 需整数、XSS 存为 `Literal::Str`）。无运行时钩子/插件/事件总线；授权为 GRANT/REVOKE 语句级，权限执行已由既有 e2e/cluster 测试覆盖。
+- 运行命令：`cargo test --workspace`（或单 crate `cargo test -p nebula-sql`）
+- 测试框架：Rust `#[cfg(test)]` + `cargo test`（集成测试位于各 crate `tests/`）
+- 模型：豆包（Doubao）生成
+
 # Testing Nebula
 
 Nebula is a workspace of crates (a memory database with a hand-written SQL
