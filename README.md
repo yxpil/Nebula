@@ -309,3 +309,15 @@ scripts/               测试报告生成器
 ## License
 
 [MIT](LICENSE) © 2026 yxpil
+
+---
+
+<div align="center">
+
+<a href="https://github.com/yxpil/Nebula">
+  <img width="100%" src="https://alittlecatgirlpanel.yxp.hk/card?repo=yxpil/Nebula" alt="gh-card · yxpil/Nebula" />
+</a>
+
+<sub>Powered by <a href="https://alittlecatgirlpanel.yxp.hk"><b>gh-card</b></a> · 粉色手写体 README 仓库名片</sub>
+
+</div>
